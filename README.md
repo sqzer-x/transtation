@@ -4,8 +4,8 @@ Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
 container on any Linux box that has Docker.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.0/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.0 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.1/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.1 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -45,7 +45,7 @@ transtation exists because of a narrower set of preferences:
 Two-step form above is the recommended one. If you are going to pipe it anyway:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.0/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.1/install.sh | sudo sh
 ```
 
 The installer needs root, refuses anything other than x86_64/aarch64, installs
@@ -59,7 +59,7 @@ If you already run Docker and prefer to do it yourself:
 # /opt/transtation/docker-compose.yml
 services:
   proxy:
-    image: ghcr.io/sqzer-x/transtation:v1.0.0
+    image: ghcr.io/sqzer-x/transtation:v1.0.1
     container_name: transtation
     restart: unless-stopped
     ports: ["443:8443"]
@@ -128,7 +128,7 @@ install -Dm600 /dev/stdin /etc/transtation/uri   # paste the vless:// link, then
 docker run -d --name transtation-client --restart unless-stopped \
   -p 127.0.0.1:1080:1080 \
   -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.0
+  ghcr.io/sqzer-x/transtation-client:v1.0.1
 ```
 
 ```
@@ -162,7 +162,7 @@ docker run -d --name transtation-client --restart unless-stopped \
   -e MODE=tun \
   -e DIRECT_SUFFIXES=example.com,example.net \
   -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.0
+  ghcr.io/sqzer-x/transtation-client:v1.0.1
 ```
 
 Exactly three extra flags. `--privileged` is **not** needed and must not be

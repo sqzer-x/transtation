@@ -15,12 +15,12 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.0}
+VERSION=${TT_VERSION:-v1.0.1}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.0, and the hash-verified installer you read would vouch for nothing.
+# v1.0.1, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 
@@ -408,14 +408,21 @@ uninstall() {
 }
 
 main() {
-	case "${1:-server}" in
-		server) shift 2>/dev/null || true; install_server ;;
-		client) shift; install_client "$@" ;;
+	# `shift` with no positional parameters is a special-builtin error, and a
+	# POSIX shell exits on those -- `|| true` does not save you. dash is
+	# /bin/sh on Debian and Ubuntu, so `sh install.sh` with no arguments used
+	# to die here, silently, on the primary target. bash (Arch's /bin/sh) is
+	# forgiving, which is exactly why local testing never saw it.
+	_cmd=${1:-server}
+	if [ $# -gt 0 ]; then shift; fi
+	case "$_cmd" in
+		server) install_server ;;
+		client) install_client "$@" ;;
 		--uninstall | uninstall) uninstall ;;
 		-h | --help)
 			sed -n '2,10p' "$0" 2>/dev/null || say "see https://github.com/sqzer-x/transtation"
 			;;
-		*) die "unknown command: $1 (expected: server, client, --uninstall)" ;;
+		*) die "unknown command: $_cmd (expected: server, client, --uninstall)" ;;
 	esac
 }
 

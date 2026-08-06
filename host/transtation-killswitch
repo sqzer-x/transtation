@@ -43,9 +43,18 @@ server_endpoint() {
 		*) die "cannot parse a host:port out of $URI_FILE" ;;
 	esac
 	case "$_h" in
+		*:*)
+			# An IPv6 literal would be spliced into an `ip daddr` rule and nft
+			# would reject the whole ruleset, leaving the host with no killswitch
+			# at all rather than a broken one. transtation is IPv4-only end to end
+			# anyway: the client resolves the server with getent ahostsv4 and the
+			# tun DNS strategy is ipv4_only.
+			die "the server address in $URI_FILE is IPv6 ($_h).
+    transtation is IPv4-only for now, so the killswitch cannot be built for it.
+    Use an IPv4 address or a name with an A record, or set SERVER_IP yourself." ;;
 		*[!0-9.]*)
-			_h=$(getent ahostsv4 "$_h" | awk 'NR==1 {print $1}')
-			[ -n "$_h" ] || die "cannot resolve the server address in $URI_FILE"
+			_h=$(getent ahostsv4 "$_h" 2>/dev/null | awk 'NR==1 {print $1}')
+			[ -n "$_h" ] || die "cannot resolve the server address in $URI_FILE to an IPv4 address"
 			;;
 	esac
 	SERVER_IP=${SERVER_IP:-$_h}

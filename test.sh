@@ -106,6 +106,20 @@ check "server image default user is not root" image_user_nonroot
 check "server image ships no geoip/geosite data" no_geodata
 
 echo
+echo "== the installer runs under a real POSIX /bin/sh, not just bash =="
+# `shift` with no positional parameters is a special-builtin error and a POSIX
+# shell EXITS on it, `|| true` notwithstanding. dash is /bin/sh on Debian and
+# Ubuntu, so `sh install.sh` with no arguments died there silently while every
+# bash-based test passed. Run the real thing, as a non-root user, in both
+# shells, and require the root message rather than merely a non-zero exit.
+posix_sh_ok() {
+	_o=$(docker run --rm -v "$PWD":/w:ro -u 65534 "$1" sh -c "cd /w && $2 install.sh" 2>&1) || true
+	case "$_o" in *"needs root"*) return 0 ;; *) return 1 ;; esac
+}
+check "install.sh survives dash (Debian, Ubuntu) with no arguments" posix_sh_ok debian:stable-slim dash
+check "install.sh survives busybox ash (Alpine) with no arguments" posix_sh_ok alpine:3.23 sh
+
+echo
 echo "== client config renders and sing-box accepts it =="
 docker run --rm --network none \
 	-e TT_URI="$FIXTURE_URI" \

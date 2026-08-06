@@ -56,6 +56,16 @@ check "the compose block caps the log size (xray logs to stdout)" present_in_com
 check "the compose block uses a named volume, not a bind mount" present_in_compose 'transtation-data:/data'
 check "no script ever runs 'nft flush ruleset'" uncommented_absent 'flush ruleset' host/transtation-killswitch
 
+# /usr/local/bin/xray is where the official Xray installer and most hand-rolled
+# setups put their binary. Installing ours there overwrote a working server, and
+# uninstalling then deleted it -- taking that server down. Ours live in a
+# private directory and the uninstall only ever removes that.
+no_clobber() { ! grep -qE "install -Dm?0?755 [^ ]+ /usr/local/bin/(xray|wgcf|sing-box)" install.sh; }
+no_foreign_rm() { ! grep -qE "rm -[rf]+ .*/usr/local/bin/(xray|wgcf|sing-box)" install.sh; }
+check "the installer never writes third-party binaries into /usr/local/bin" no_clobber
+check "the uninstaller never deletes third-party binaries it did not install" no_foreign_rm
+
+
 # The version is repeated in the installer and in every documented command.
 # It drifted five releases once, because bumping it was a hand-run sed, and the
 # README ended up telling people to install a version without the security

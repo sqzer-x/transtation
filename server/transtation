@@ -932,10 +932,12 @@ cmd_selftest() {
 
 	# Same injection class as the client's link parser, arriving by environment.
 	_env_rejects() {
-		(SNI=www.cloudflare.com DEST="" PORT=443
+		(SNI=www.cloudflare.com DEST="" PORT=443 HOST=203.0.113.10
 			eval "$1=\$2"
 			validate_config_env) >/dev/null 2>&1 && return 1 || return 0
 	}
+	_assert "an IPv6 HOST is refused (the rest of the stack is IPv4-only)" \
+		_env_rejects HOST '2406:da14:157d:8900::1'
 	_assert "MIN_CLIENT_VER is not free text" _env_rejects MIN_CLIENT_VER '0.0.0", "show": true, "x": "'
 	_assert "WARP_ENDPOINT must be an IPv4 address and port" _env_rejects WARP_ENDPOINT 'evil.example:2408'
 
@@ -975,6 +977,12 @@ cmd_selftest() {
 # meaningfully more trustworthy than a link someone sends you, and each check is
 # one line. Kept as its own function so the selftest can attack it directly.
 validate_config_env() {
+	case "${HOST:-}" in
+		*:*) die "HOST is an IPv6 address ($(q "$HOST")). transtation is IPv4-only for now:
+    the client resolves A records only and the killswitch refuses an IPv6
+    server, so a link naming this address would not work. Set HOST to an IPv4
+    address or a name with an A record." ;;
+	esac
 	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
 		die "SNI must be a hostname, got: $(q "$SNI")"
 	case "$SNI" in
@@ -1041,11 +1049,18 @@ cmd_run() {
 	fi
 
 	# --- where are we? one request, used for both the address and the region ---
-	_trace=$(curl -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null) || _trace=""
+	# -4 is not optional. On a dual-stack host curl prefers IPv6, so the address
+	# discovered here -- the one that goes into every share link -- came back as
+	# an IPv6 literal, which nothing else in this stack can use: the client
+	# resolves A records only, its DNS strategy is ipv4_only, and the killswitch
+	# refuses an IPv6 server outright. A container hid this, because Docker's
+	# default bridge is IPv4-only.
+	_trace=$(curl -4 -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null) || _trace=""
 	[ -n "${HOST:-}" ] || HOST=$(printf '%s' "$_trace" | sed -n 's/^ip=//p')
 	[ -n "${HOST:-}" ] || die \
-		"could not auto-detect this host's public address.
-    Set HOST=<your.ip.or.domain> in your .env and start again."
+		"could not auto-detect this host's public IPv4 address.
+    Set HOST=<your.ip.or.domain> in $(env_hint) and start again.
+    (transtation is IPv4-only for now; an IPv6-only host is not supported.)"
 	LOC=$(printf '%s' "$_trace" | sed -n 's/^loc=//p')
 
 	# --- SNI: env override, else the sticky auto-selection, else pick now ---

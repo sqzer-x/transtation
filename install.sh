@@ -15,12 +15,12 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.13}
+VERSION=${TT_VERSION:-v1.0.14}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.13, and the hash-verified installer you read would vouch for nothing.
+# v1.0.14, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 
@@ -32,6 +32,12 @@ WGCF_VERSION=${TT_WGCF_VERSION:-2.2.32}
 SINGBOX_VERSION=${TT_SINGBOX_VERSION:-1.13.16}
 SINGBOX_SHA_amd64=9ff0345fde4157a6bdab45a615668d41ccc93f6d0f361108042a48b8a49a9baa
 SINGBOX_SHA_arm64=3ea951c68f2eea10fd3ee8f8cc7794c12ccc7405afa99279a79e0b41cb183adf
+
+# Our copies of third-party binaries live here, never in /usr/local/bin. That
+# is where the official Xray installer and hand-rolled setups put theirs, and
+# writing there means overwriting somebody's working server -- and then deleting
+# it on uninstall. Which is exactly what happened once.
+PRIVLIB=/usr/local/lib/transtation
 
 DIR=${TT_DIR:-/opt/transtation}
 URI_DIR=/etc/transtation
@@ -125,6 +131,29 @@ wait_healthy() {
 
 # --- native server -------------------------------------------------------
 
+# The two server installs both own /usr/local/bin/transtation and both want the
+# same port. Installing one over the other leaves the first running and
+# orphaned -- still holding a port, still serving its own identity, no longer
+# reachable by the command. Refuse instead.
+refuse_other_server() {
+	case "$1" in
+		container)
+			[ -e /etc/systemd/system/transtation.service ] &&
+				die "a native server is already installed here.
+    Remove it first:  sh install.sh --uninstall
+    Or keep it -- it is the same software."
+			;;
+		native)
+			{ [ -e "$DIR/docker-compose.yml" ] || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx transtation; } &&
+				die "a containerised server is already installed here.
+    Remove it first:  sh install.sh --uninstall
+    Or keep it -- it is the same software."
+			;;
+	esac
+	return 0
+}
+
+
 fetch_verified_xray() {
 	case "$(uname -m)" in
 		x86_64 | amd64) _xz=Xray-linux-64.zip; _wa=amd64 ;;
@@ -143,7 +172,7 @@ fetch_verified_xray() {
 		{ rm -rf "$_t"; die "Xray checksum mismatch -- refusing to install it"; }
 	command -v unzip >/dev/null 2>&1 || install_pkg unzip
 	unzip -q -j "$_t/$_xz" xray -d "$_t"
-	install -Dm0755 "$_t/xray" /usr/local/bin/xray
+	install -Dm0755 "$_t/xray" "$PRIVLIB/xray"
 
 	_w="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}"
 	curl -fsSL -o "$_t/wgcf" "$_w/wgcf_${WGCF_VERSION}_linux_${_wa}" ||
@@ -151,9 +180,9 @@ fetch_verified_xray() {
 	curl -fsSL "$_w/checksums.txt" | grep " wgcf_${WGCF_VERSION}_linux_${_wa}\$" |
 		awk -v f="$_t/wgcf" '{print $1"  "f}' | sha256sum -c - >/dev/null 2>&1 ||
 		{ rm -rf "$_t"; die "wgcf checksum mismatch -- refusing to install it"; }
-	install -Dm0755 "$_t/wgcf" /usr/local/bin/wgcf
+	install -Dm0755 "$_t/wgcf" "$PRIVLIB/wgcf"
 	rm -rf "$_t"
-	step binaries "xray $(/usr/local/bin/xray version | head -1 | cut -d' ' -f2) and wgcf ${WGCF_VERSION}, both checksum-verified"
+	step binaries "xray $("$PRIVLIB/xray" version | head -1 | cut -d' ' -f2) and wgcf ${WGCF_VERSION}, both checksum-verified, in $PRIVLIB"
 }
 
 install_pkg() {
@@ -168,6 +197,7 @@ install_pkg() {
 install_server_native() {
 	need_root
 	check_arch
+	refuse_other_server native
 	say ""
 	say "  transtation $VERSION -- native install, no container runtime"
 	say "  https://github.com/sqzer-x/transtation"
@@ -178,7 +208,7 @@ install_server_native() {
 	command -v curl >/dev/null 2>&1 || die "curl is required"
 
 	fetch_verified_xray
-	install -Dm0755 "$(server_script)" /usr/local/lib/transtation/server
+	install -Dm0755 "$(server_script)" "$PRIVLIB/server"
 
 	id -u transtation >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin transtation 2>/dev/null ||
 		adduser -S -D -H -s /sbin/nologin transtation 2>/dev/null || true
@@ -194,13 +224,13 @@ install_server_native() {
 		#!/bin/sh
 		set -eu
 		if [ "$(id -un)" = transtation ]; then
-		  exec env TT_DATA=/var/lib/transtation /usr/local/lib/transtation/server "$@"
+		  exec env TT_DATA=/var/lib/transtation PATH=/usr/local/lib/transtation:$PATH /usr/local/lib/transtation/server "$@"
 		fi
 		[ "$(id -u)" = 0 ] || { echo "transtation: run this as root or as the transtation user" >&2; exit 1; }
 		if command -v runuser >/dev/null 2>&1; then
-		  exec runuser -u transtation -- env TT_DATA=/var/lib/transtation /usr/local/lib/transtation/server "$@"
+		  exec runuser -u transtation -- env TT_DATA=/var/lib/transtation PATH=/usr/local/lib/transtation:$PATH /usr/local/lib/transtation/server "$@"
 		fi
-		exec su -s /bin/sh transtation -c 'exec env TT_DATA=/var/lib/transtation /usr/local/lib/transtation/server "$@"' -- sh "$@"
+		exec su -s /bin/sh transtation -c 'exec env TT_DATA=/var/lib/transtation PATH=/usr/local/lib/transtation:$PATH /usr/local/lib/transtation/server "$@"' -- sh "$@"
 	WRAP
 	step config "wrote /etc/transtation/server.env, data in /var/lib/transtation"
 
@@ -215,6 +245,7 @@ install_server_native() {
 		User=transtation
 		Group=transtation
 		Environment=TT_DATA=/var/lib/transtation
+		Environment=PATH=/usr/local/lib/transtation:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 		EnvironmentFile=-/etc/transtation/server.env
 		ExecStart=/usr/local/lib/transtation/server run
 		Restart=on-failure
@@ -293,6 +324,7 @@ server_script() {
 install_server() {
 	need_root
 	check_arch
+	refuse_other_server container
 	say ""
 	say "  transtation $VERSION -- your own VLESS + REALITY proxy"
 	say "  https://github.com/sqzer-x/transtation"
@@ -506,9 +538,9 @@ install_sing_box() {
 	echo "$_sum  $_t/sb.tgz" | sha256sum -c - >/dev/null 2>&1 ||
 		{ rm -rf "$_t"; die "sing-box checksum mismatch -- refusing to install it"; }
 	tar xzf "$_t/sb.tgz" -C "$_t"
-	install -Dm0755 "$_t/$_n/sing-box" /usr/local/bin/sing-box
+	install -Dm0755 "$_t/$_n/sing-box" "$PRIVLIB/sing-box"
 	rm -rf "$_t"
-	SINGBOX=/usr/local/bin/sing-box
+	SINGBOX=$PRIVLIB/sing-box
 	step sing-box "$($SINGBOX version | head -1)  (verified, statically linked)"
 }
 
@@ -686,7 +718,7 @@ uninstall() {
 		systemctl disable --now transtation.service >/dev/null 2>&1 || true
 		rm -f /etc/systemd/system/transtation.service
 		systemctl daemon-reload 2>/dev/null || true
-		rm -rf /usr/local/bin/transtation /usr/local/lib/transtation /usr/local/bin/xray /usr/local/bin/wgcf
+		rm -rf /usr/local/bin/transtation "$PRIVLIB"
 		say "native server removed. Its data is still in /var/lib/transtation."
 		ask 'also delete /var/lib/transtation? That destroys your Reality key and every issued link. [y/N] '
 		say ""
@@ -700,6 +732,8 @@ uninstall() {
 		rm -f /etc/systemd/system/transtation-client.service
 		systemctl daemon-reload 2>/dev/null || true
 		rm -f /usr/local/bin/transtation-client
+		rm -f "$PRIVLIB/sing-box"
+		rmdir "$PRIVLIB" 2>/dev/null || true
 		say "client removed."
 	fi
 	rm -f /usr/local/sbin/transtation-panic

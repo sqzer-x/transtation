@@ -4,8 +4,8 @@ Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
 container on any Linux box that has Docker.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.13/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.13 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.14/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.14 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -46,8 +46,8 @@ how you feel about a container runtime on your VPS.
 ### In a container (default)
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.13/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.13 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.14/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.14 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```

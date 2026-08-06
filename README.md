@@ -6,8 +6,8 @@ the client is a native install, because putting a machine behind a proxy means
 owning its routing table and a container is the wrong shape for that.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.17/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.17 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.18/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.18 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -49,8 +49,8 @@ how you feel about a container runtime on your VPS.
 ### In a container (default)
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.17/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.17 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.18/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.18 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```

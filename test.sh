@@ -121,7 +121,23 @@ wrapper_backup_is_0600() (
 	transtation restore "$_t/junk.tgz" >/dev/null 2>&1 && return 1
 	return 0
 )
+# `transtation show` straight after `systemctl start` used to be told to restart,
+# which loops you: waiting was all it needed. It now waits -- but only while the
+# service is actually coming up. A stopped server must still fail immediately,
+# or every command on a down server hangs for fifteen seconds.
+down_server_fails_fast() (
+	_d=$(mktemp -d) _b=$(mktemp -d) || return 1
+	trap 'rm -rf "$_d" "$_b"' EXIT
+	printf 'SCHEMA=1\nREALITY_PRIV=x\nREALITY_PUB=y\nCREATED=2026-01-01\n' >"$_d/state.env"
+	printf 'main\t8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d\t1c69b566b0480c74\n' >"$_d/users.tsv"
+	printf '#!/bin/sh\nexit 3\n' >"$_b/systemctl"   # "inactive"
+	chmod +x "$_b/systemctl"
+	_t0=$(date +%s)
+	PATH="$_b:$PATH" TT_MANAGED=systemd TT_DATA=$_d sh server/transtation status >/dev/null 2>&1 && return 1
+	[ $(( $(date +%s) - _t0 )) -lt 3 ]
+)
 check "both install paths implement the same transtation verbs" wrapper_parity
+check "a stopped server fails immediately instead of waiting for it" down_server_fails_fast
 check "native backup is 0600 even under root's umask, and will not clobber" wrapper_backup_is_0600
 
 

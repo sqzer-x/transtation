@@ -24,6 +24,13 @@ TAB=$(printf '\t')
 TT_MANAGED=${TT_MANAGED:-systemd}
 restart_hint() { [ "$TT_MANAGED" = docker ] && printf 'docker compose up -d' || printf 'systemctl restart transtation'; }
 env_hint() { [ "$TT_MANAGED" = docker ] && printf '/opt/transtation/.env' || printf '/etc/transtation/server.env'; }
+# Is the server up, or on its way up? Under docker this command only runs at all
+# because `docker exec` found a live container, so the answer is yes by
+# construction; natively, ask the init system.
+server_starting() {
+	[ "$TT_MANAGED" = docker ] && return 0
+	systemctl is-active --quiet transtation 2>/dev/null
+}
 
 set_paths() {
 	# The container mounts its volume at /data; a native install keeps state
@@ -323,6 +330,15 @@ write_runtime() {
 }
 
 load_runtime() {
+	# The runtime file is written a moment into startup, after the dest probe.
+	# Running `transtation show` straight after `systemctl start` therefore used
+	# to be told to restart -- advice that loops you, because waiting was all it
+	# needed. Wait briefly when the thing is genuinely coming up, and only then
+	# say so.
+	if [ ! -f "$RUNTIME" ] && server_starting; then
+		_w=0
+		while [ ! -f "$RUNTIME" ] && [ "$_w" -lt 15 ]; do sleep 1; _w=$((_w + 1)); done
+	fi
 	[ -f "$RUNTIME" ] || die "server has not started yet -- run '$(restart_hint)' first"
 	HOST=""; PORT=""; LISTEN_PORT=""; SNI=""; DEST=""; WARP=""; WARP_READY=""; SNI_REASON=""
 	while IFS='=' read -r _k _v; do

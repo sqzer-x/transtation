@@ -139,6 +139,13 @@ install_server() {
 			    ports: ["\${PORT:-443}:8443"]
 			    volumes: ["transtation-data:/data"]
 			    env_file: .env
+			    # Hardening. The process already holds zero effective capabilities
+			    # (verified: CapEff 0000000000000000), so these mostly shrink what a
+			    # future change could quietly re-acquire.
+			    cap_drop: [ALL]
+			    security_opt: ["no-new-privileges:true"]
+			    read_only: true
+			    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
 			    logging:
 			      driver: json-file
 			      options: { max-size: "10m", max-file: "3" }

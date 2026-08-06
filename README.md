@@ -65,6 +65,10 @@ services:
     ports: ["443:8443"]
     volumes: ["transtation-data:/data"]
     env_file: .env
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
     logging:
       driver: json-file
       options: { max-size: "10m", max-file: "3" }

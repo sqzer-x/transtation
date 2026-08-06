@@ -56,6 +56,12 @@ present_in_compose() { server_compose | grep -qE "$1"; }
 check "the compose block caps the log size (xray logs to stdout)" present_in_compose 'max-size'
 check "the compose block uses a named volume, not a bind mount" present_in_compose 'transtation-data:/data'
 check "no script ever runs 'nft flush ruleset'" uncommented_absent 'flush ruleset' host/transtation-killswitch
+# Hardening the compose file grants. The running process was verified to hold
+# CapEff 0000000000000000 with these in place.
+check "the compose block drops all capabilities" present_in_compose "cap_drop"
+check "the compose block sets no-new-privileges" present_in_compose "no-new-privileges"
+check "the compose block mounts the root filesystem read-only" present_in_compose "read_only"
+
 
 if ! command -v docker >/dev/null 2>&1; then
 	echo

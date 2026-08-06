@@ -17,6 +17,10 @@ TUN_ADDR=172.19.0.1/30
 SOCKS_PORT=${SOCKS_PORT:-1080}
 
 die() { printf 'transtation-client: %s\n' "$*" >&2; exit 1; }
+# Anything taken from a share link and quoted back at the operator goes through
+# this first. A link is attacker-supplied, error messages land on a terminal,
+# and raw escape sequences let a crafted link paint whatever it likes there.
+q() { printf '%s' "$1" | tr -dc '[:print:]' | cut -c1-64; }
 warn() { printf 'transtation-client: %s\n' "$*" >&2; }
 
 # --------------------------------------------------------------- share link
@@ -77,11 +81,11 @@ validate() {
 		die "bad pbk: expected 43 characters, got ${#PBK}. Reissue the link with 'transtation show'."
 	printf '%s' "$PBK" | grep -Eq '^[A-Za-z0-9_-]{43}$' || die "pbk is not base64url"
 	printf '%s' "$SID" | grep -Eq '^([0-9a-fA-F]{2}){1,8}$' ||
-		die "bad sid: expected 2-16 hex characters, got '$SID'"
-	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || die "bad or missing sni"
+		die "bad sid: expected 2-16 hex characters, got '$(q "$SID")'"
+	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || die "bad or missing sni: '$(q "$SNI")'"
 	[ -n "$HOST" ] || die "link has no server address"
 	printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] ||
-		die "bad port: $PORT"
+		die "bad port: $(q "$PORT")"
 	# sing-box hard-errors with "uTLS is required by reality client" if the
 	# fingerprint is absent, where Xray-based clients would tolerate it.
 	FP=${FP:-chrome}
@@ -94,22 +98,22 @@ validate() {
 	# certificate checking switched off.
 	case "$FLOW" in
 		xtls-rprx-vision | none | '') ;;
-		*) die "unsupported flow in link: $FLOW (expected xtls-rprx-vision)" ;;
+		*) die "unsupported flow in link: $(q "$FLOW") (expected xtls-rprx-vision)" ;;
 	esac
 	[ "$FLOW" = none ] && FLOW=""
 	case "$FP" in
 		chrome | firefox | edge | safari | ios | android | random | randomized | 360 | qq) ;;
-		*) die "unsupported uTLS fingerprint in link: $FP" ;;
+		*) die "unsupported uTLS fingerprint in link: $(q "$FP")" ;;
 	esac
 
 	# Operator-supplied, but the same class of hole and just as cheap to close.
 	printf '%s' "$SOCKS_PORT" | grep -Eq '^[0-9]{1,5}$' &&
 		[ "$SOCKS_PORT" -ge 1 ] && [ "$SOCKS_PORT" -le 65535 ] ||
-		die "SOCKS_PORT must be 1-65535, got: $SOCKS_PORT"
+		die "SOCKS_PORT must be 1-65535, got: $(q "$SOCKS_PORT")"
 	if [ -n "${DIRECT_SUFFIXES:-}" ]; then
 		for _d in $(printf '%s' "$DIRECT_SUFFIXES" | tr ',' ' '); do
 			printf '%s' "$_d" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' ||
-				die "DIRECT_SUFFIXES entry is not a domain suffix: $_d"
+				die "DIRECT_SUFFIXES entry is not a domain suffix: $(q "$_d")"
 		done
 	fi
 
@@ -119,7 +123,7 @@ validate() {
 	case "$HOST" in
 		*[!0-9.]*)
 			_ip=$(resolve4 "$HOST") || true
-			[ -n "$_ip" ] || die "cannot resolve $HOST from inside the container"
+			[ -n "$_ip" ] || die "cannot resolve $(q "$HOST") from inside the container"
 			printf 'resolved %s -> %s\n' "$HOST" "$_ip"
 			SERVER_IP=$_ip
 			;;

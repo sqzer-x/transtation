@@ -31,6 +31,8 @@ set_paths
 
 die() { printf 'transtation: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'transtation: %s\n' "$*" >&2; }
+# Values echoed back at the operator are stripped of control characters first.
+q() { printf '%s' "$1" | tr -dc '[:print:]' | cut -c1-64; }
 
 # State files are PARSED, never `.`-sourced: the values include free text such
 # as "best of KR-region candidates", and sourcing that runs `of` as a command.
@@ -586,7 +588,7 @@ sni_auto() {
 
 sni_write() {
 	printf '%s' "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
-		die "not a hostname: $1"
+		die "not a hostname: $(q "$1")"
 	case "$1" in
 		*apple* | *icloud*) die "Xray warns that apple/icloud targets get your IP blocked by the GFW." ;;
 	esac
@@ -941,21 +943,21 @@ cmd_selftest() {
 # one line. Kept as its own function so the selftest can attack it directly.
 validate_config_env() {
 	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
-		die "SNI must be a hostname, got: $SNI"
+		die "SNI must be a hostname, got: $(q "$SNI")"
 	case "$SNI" in
 		*apple* | *icloud*) die "Xray warns that apple/icloud targets get your IP blocked by the GFW. Pick another SNI." ;;
 	esac
 	DEST=${DEST:-$SNI:443}
-	printf '%s' "$DEST" | grep -Eq '^[A-Za-z0-9.-]+:[0-9]{1,5}$' || die "DEST must be host:port, got: $DEST"
+	printf '%s' "$DEST" | grep -Eq '^[A-Za-z0-9.-]+:[0-9]{1,5}$' || die "DEST must be host:port, got: $(q "$DEST")"
 	PORT=${PORT:-443}
 	printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] ||
-		die "PORT must be 1-65535, got: $PORT"
+		die "PORT must be 1-65535, got: $(q "$PORT")"
 	printf '%s' "${MIN_CLIENT_VER:-0.0.0}" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){0,2}$' ||
-		die "MIN_CLIENT_VER must look like 0.0.0, got: ${MIN_CLIENT_VER:-}"
+		die "MIN_CLIENT_VER must look like 0.0.0, got: $(q "${MIN_CLIENT_VER:-}")"
 	# Deliberately IPv4:port only, never a hostname: resolving the WARP endpoint
 	# is exactly what produced the random IPv6 failures this design removed.
 	printf '%s' "${WARP_ENDPOINT:-$WARP_ENDPOINT_DEFAULT}" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$' ||
-		die "WARP_ENDPOINT must be an IPv4 address and port, got: ${WARP_ENDPOINT:-}"
+		die "WARP_ENDPOINT must be an IPv4 address and port, got: $(q "${WARP_ENDPOINT:-}")"
 }
 
 # --------------------------------------------------------------------- run

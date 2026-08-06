@@ -480,8 +480,10 @@ about. The full picture, on a Korean client and an AWS Tokyo VPS:
   pulls the image, healthy in 12s, `verify` completes a REALITY handshake and
   reports `warp=on colo=NRT`.
 - **Client to server across the internet, no tunnels.** Client container in
-  Korea to `203.0.113.10:443` in Tokyo. 10 MB in 1.21 s (≈8.3 MB/s) through
-  Korea → Tokyo → WARP.
+  Korea to a Tokyo VPS with the host's own proxy stopped, so nothing was
+  measured through a second proxy. Steady-state request latency ≈0.20 s,
+  throughput 6.5–8.3 MB/s for a 10 MB download, and 0.9 s from `docker run` to
+  the first byte through the tunnel.
 - **The camouflage, from outside.** `openssl s_client` against the server on
   :443 returns a genuine `C=JP, O=TVer INC., CN=*.tver.jp` certificate over
   TLS 1.3 — the dest the auto-selection chose for a Japanese server, unprompted.
@@ -496,6 +498,11 @@ about. The full picture, on a Korean client and an AWS Tokyo VPS:
   refuses with the reason rather than half-starting; under rootful Podman it
   works.
 - **arm64.** The published arm64 image runs its selftest under emulation.
+- **Timings, measured rather than asserted.** On that VPS: 7.3 s from
+  `docker compose up` to healthy on a first boot that generates keys, picks a
+  dest and registers with WARP; 14.4 s to a proven-working proxy. Most of the
+  gap between the two is a fixed warm-up inside Xray before its first proxied
+  connection, not work this project controls.
 
 Not tested, and therefore not claimed: SELinux hosts, Docker Desktop on Windows
 or macOS, Docker older than 29, and IPv6-only hosts (the killswitch refuses

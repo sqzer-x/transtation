@@ -203,7 +203,7 @@ else. Measured on a host with the client running:
 ```
 curl https://api.ipify.org                 198.51.100.23   your own address
 curl https://api.ipify.org   (after the exports)
-                                           192.0.2.7    through the proxy
+                                           192.0.2.7       through the proxy
 env -i curl https://api.ipify.org          198.51.100.23   your own address
    … and the same from any other terminal, and from anything your desktop starts
 ```

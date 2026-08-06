@@ -15,12 +15,12 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.8}
+VERSION=${TT_VERSION:-v1.0.9}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.8, and the hash-verified installer you read would vouch for nothing.
+# v1.0.9, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 

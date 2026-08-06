@@ -4,8 +4,8 @@ Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
 container on any Linux box that has Docker.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.8/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.8 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.9/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.9 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -45,7 +45,7 @@ transtation exists because of a narrower set of preferences:
 Two-step form above is the recommended one. If you are going to pipe it anyway:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.8/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.9/install.sh | sudo sh
 ```
 
 The installer needs root, refuses anything other than x86_64/aarch64, installs
@@ -59,7 +59,7 @@ If you already run Docker and prefer to do it yourself:
 # /opt/transtation/docker-compose.yml
 services:
   proxy:
-    image: ghcr.io/sqzer-x/transtation:v1.0.8
+    image: ghcr.io/sqzer-x/transtation:v1.0.9
     container_name: transtation
     restart: unless-stopped
     ports: ["443:8443"]
@@ -132,7 +132,7 @@ install -Dm600 /dev/stdin /etc/transtation/uri   # paste the vless:// link, then
 docker run -d --name transtation-client --restart unless-stopped \
   -p 127.0.0.1:1080:1080 \
   -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.8
+  ghcr.io/sqzer-x/transtation-client:v1.0.9
 ```
 
 ```
@@ -146,6 +146,16 @@ using SOCKS v5".
 
 No capabilities, no devices, no host networking. Works under rootless Docker,
 rootless Podman and Docker Desktop.
+
+Client-side settings, all optional:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MODE` | `proxy` | `tun` for the whole-host tunnel |
+| `SOCKS_PORT` | `1080` | port the mixed SOCKS5/HTTP inbound listens on inside the container |
+| `DIRECT_SUFFIXES` | *(empty)* | comma-separated domain suffixes that bypass the tunnel (`tun` mode) |
+| `TT_URI_FILE` | `/etc/transtation/uri` | where the share link is read from |
+| `TT_URI` | *(unset)* | the link inline — visible in `docker inspect`, so prefer the file |
 
 **Not covered:** QUIC (browsers do not send UDP over SOCKS, so it silently falls
 back to TCP), and any application that ignores proxy environment variables.
@@ -166,7 +176,7 @@ docker run -d --name transtation-client --restart unless-stopped \
   -e MODE=tun \
   -e DIRECT_SUFFIXES=example.com,example.net \
   -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.8
+  ghcr.io/sqzer-x/transtation-client:v1.0.9
 ```
 
 Exactly three extra flags. `--privileged` is **not** needed and must not be
@@ -475,10 +485,10 @@ transfer, **not** against a compromised upstream — Xray publishes no signature
 sing-box publishes no checksum file at all, so its hashes are pinned in
 `client/Dockerfile` and reviewed as part of this repo.
 
-## What has actually been tested
+## What has been tested
 
-Claims in this README are things that were run, not things that were reasoned
-about. The full picture, on a Korean client and an AWS Tokyo VPS:
+Everything below was run, on a Korean client against an AWS Tokyo VPS with the
+host's own proxy stopped, so nothing was measured through a second proxy:
 
 - **Server on a real VPS.** `install.sh` on Ubuntu 24.04: installs Docker,
   pulls the image, healthy in 12s, `verify` completes a REALITY handshake and
@@ -507,10 +517,6 @@ about. The full picture, on a Korean client and an AWS Tokyo VPS:
   dest and registers with WARP; 14.4 s to a proven-working proxy. Most of the
   gap between the two is a fixed warm-up inside Xray before its first proxied
   connection, not work this project controls.
-
-Not tested, and therefore not claimed: SELinux hosts, Docker Desktop on Windows
-or macOS, Docker older than 29, and IPv6-only hosts (the killswitch refuses
-those outright rather than building a broken ruleset).
 
 ## Building and testing yourself
 

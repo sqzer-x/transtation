@@ -56,6 +56,17 @@ present_in_compose() { server_compose | grep -qE "$1"; }
 check "the compose block caps the log size (xray logs to stdout)" present_in_compose 'max-size'
 check "the compose block uses a named volume, not a bind mount" present_in_compose 'transtation-data:/data'
 check "no script ever runs 'nft flush ruleset'" uncommented_absent 'flush ruleset' host/transtation-killswitch
+
+# The version is repeated in the installer and in every documented command.
+# It drifted five releases once, because bumping it was a hand-run sed, and the
+# README ended up telling people to install a version without the security
+# fixes. One check is cheaper than remembering.
+versions_agree() {
+    _v=$(sed -n 's/^VERSION=${TT_VERSION:-\(v[0-9.]*\)}.*/\1/p' install.sh)
+    [ -n "$_v" ] || return 1
+    ! grep -oE 'v1\.[0-9]+\.[0-9]+' install.sh README.md | grep -v ":$_v$" | grep -q .
+}
+check "every documented version string matches install.sh" versions_agree
 # Hardening the compose file grants. The running process was verified to hold
 # CapEff 0000000000000000 with these in place.
 check "the compose block drops all capabilities" present_in_compose "cap_drop"

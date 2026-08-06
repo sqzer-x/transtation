@@ -19,6 +19,16 @@ jobs:
       - name: shellcheck
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 
+      - name: version strings must match the tag being released
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          want="${GITHUB_REF_NAME}"
+          got=$(sed -n 's/^VERSION=${TT_VERSION:-\(v[0-9.]*\)}.*/\1/p' install.sh)
+          echo "tag=$want  install.sh=$got"
+          [ "$want" = "$got" ] || { echo "::error::install.sh pins $got but the tag is $want"; exit 1; }
+          bad=$(grep -oE 'v1\.[0-9]+\.[0-9]+' install.sh README.md | grep -v ":$want$" || true)
+          [ -z "$bad" ] || { echo "::error::stale version strings:"; echo "$bad"; exit 1; }
+
       # Builds both images for amd64 only and runs their offline self-checks.
       # Everything runs with --network none, so CI never registers a WARP
       # identity: hammering Cloudflare's registration endpoint from shared

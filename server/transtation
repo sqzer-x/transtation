@@ -32,10 +32,11 @@ set_paths
 die() { printf 'transtation: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'transtation: %s\n' "$*" >&2; }
 
-# Read KEY from a KEY=value file. Never `.`-source these: the values include
-# free text such as "best of KR-region candidates", and sourcing that runs `of`
-# as a command. Parsing also means a tampered state file cannot execute code.
-kv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
+# State files are PARSED, never `.`-sourced: the values include free text such
+# as "best of KR-region candidates", and sourcing that runs `of` as a command.
+# Parsing also means a tampered state file cannot execute code. Each loader
+# reads its file once with the shell's own `read` rather than spawning a
+# process per key.
 
 # ---------------------------------------------------------------- identity
 
@@ -290,21 +291,31 @@ write_runtime() {
 
 load_runtime() {
 	[ -f "$RUNTIME" ] || die "server has not started yet -- run 'docker compose up -d' first"
-	HOST=$(kv "$RUNTIME" HOST)
-	PORT=$(kv "$RUNTIME" PORT)
-	SNI=$(kv "$RUNTIME" SNI)
-	DEST=$(kv "$RUNTIME" DEST)
-	WARP=$(kv "$RUNTIME" WARP)
-	WARP_READY=$(kv "$RUNTIME" WARP_READY)
-	SNI_REASON=$(kv "$RUNTIME" SNI_REASON)
+	HOST=""; PORT=""; SNI=""; DEST=""; WARP=""; WARP_READY=""; SNI_REASON=""
+	while IFS='=' read -r _k _v; do
+		case "$_k" in
+			HOST) HOST=$_v ;;
+			PORT) PORT=$_v ;;
+			SNI) SNI=$_v ;;
+			DEST) DEST=$_v ;;
+			WARP) WARP=$_v ;;
+			WARP_READY) WARP_READY=$_v ;;
+			SNI_REASON) SNI_REASON=$_v ;;
+		esac
+	done <"$RUNTIME"
 }
 
 load_state() {
 	[ -s "$STATE" ] || die "no identity yet -- start the server first"
-	SCHEMA=$(kv "$STATE" SCHEMA)
-	REALITY_PRIV=$(kv "$STATE" REALITY_PRIV)
-	REALITY_PUB=$(kv "$STATE" REALITY_PUB)
-	CREATED=$(kv "$STATE" CREATED)
+	SCHEMA=""; REALITY_PRIV=""; REALITY_PUB=""; CREATED=""
+	while IFS='=' read -r _k _v; do
+		case "$_k" in
+			SCHEMA) SCHEMA=$_v ;;
+			REALITY_PRIV) REALITY_PRIV=$_v ;;
+			REALITY_PUB) REALITY_PUB=$_v ;;
+			CREATED) CREATED=$_v ;;
+		esac
+	done <"$STATE"
 }
 
 apply() {
@@ -496,23 +507,25 @@ sni_score() {
 	printf '%s' "$_sc"
 }
 
-# One candidate: technical filter, then latency. Writes "score domain chain rtt"
-# to its own file so parallel probes cannot interleave.
+# One candidate. `xray tls ping` performs a full TLS handshake, so timing that
+# call gives the latency directly -- the earlier version made a second curl
+# round trip per candidate to measure what the first one already cost.
+# /proc/uptime is used rather than `date`, which in busybox has no %N.
 sni_probe() {
 	# "class:domain" region_match dir
 	_cls=${1%%:*} _c=${1#*:} _rm=$2 _dir=$3
+	read -r _t0 _ </proc/uptime
 	_p=$(timeout 12 xray tls ping "$_c" 2>&1) || return 0
+	read -r _t1 _ </proc/uptime
 	case "$_p" in *"Handshake succeeded"*) ;; *) return 0 ;; esac
 	# TLS 1.2 is a hard reject, not a penalty -- REALITY needs 1.3. This is not
 	# theoretical: abema.tv looked like an ideal Japanese video dest and serves
 	# only TLS 1.2.
 	case "$_p" in *"TLS Version:"*"1.3"*) ;; *) return 0 ;; esac
-	_chain=$(printf '%s' "$_p" | sed -n "s/^Certificate chain's total length: *\([0-9][0-9]*\).*/\1/p" | head -1)
+	_chain=$(printf '%s' "$_p" | sed -n "s/^Certificate chain's total length: *\\([0-9][0-9]*\\).*/\\1/p" | head -1)
 	[ -n "$_chain" ] && [ "$_chain" -le "$CHAIN_SAFE" ] || return 0
-	# busybox date has no %N, so time the TLS handshake with curl instead.
-	_t=$(curl -sS -o /dev/null --max-time 8 -w '%{time_appconnect}' "https://$_c/" 2>/dev/null) || return 0
-	_ms=$(printf '%s' "$_t" | awk '{ printf "%d", $1 * 1000 }')
-	[ -n "$_ms" ] && [ "$_ms" -gt 0 ] || return 0
+	_ms=$(awk -v a="$_t0" -v b="$_t1" 'BEGIN { printf "%d", (b - a) * 1000 }')
+	[ -n "$_ms" ] && [ "$_ms" -gt 0 ] || _ms=1
 	printf '%s %s %s %s %s %s\n' "$(sni_score "$_cls" "$_ms" "$_chain" "$_rm")" \
 		"$_c" "$_chain" "$_ms" "$_cls" "$_rm" >"$_dir/$_c"
 }
@@ -575,9 +588,14 @@ sni_write() {
 }
 
 sni_load() {
-	SNI=$(kv "$SNIFILE" SNI)
-	SNI_REASON=$(kv "$SNIFILE" SNI_REASON)
-	SNI_CHOSEN=$(kv "$SNIFILE" SNI_CHOSEN)
+	SNI=""; SNI_REASON=""; SNI_CHOSEN=""
+	while IFS='=' read -r _k _v; do
+		case "$_k" in
+			SNI) SNI=$_v ;;
+			SNI_REASON) SNI_REASON=$_v ;;
+			SNI_CHOSEN) SNI_CHOSEN=$_v ;;
+		esac
+	done <"$SNIFILE" 2>/dev/null
 	[ -n "$SNI" ] || die "$SNIFILE is empty or corrupt -- fix it with: transtation sni auto"
 }
 
@@ -635,8 +653,22 @@ cmd_verify() {
 	EOF
 	xray run -format json -c "$_d/c.json" >/dev/null 2>&1 &
 	_pid=$!
-	sleep 2
-	_out=$(curl -fsS --max-time 20 --socks5-hostname 127.0.0.1:10809 https://cloudflare.com/cdn-cgi/trace 2>/dev/null) || true
+	# The 2s settle is measured, not arbitrary. If the probe client is not ready
+	# its first outbound sits on a ~5s retry backoff, so racing to the earliest
+	# request is slower than waiting:
+	#   settle 2.0s, then request : 2.1s   <- what install.sh actually pays
+	#   settle 0.5s, 3s cap, retry: 4.1s on a cold boot (0.6s once warm)
+	# Repeat calls could be made faster, but the call that matters happens once,
+	# right after installation, and that one is fastest this way. The retries
+	# below are for hosts slower than the ones this was measured on, not speed.
+	_out=""
+	_i=0
+	while [ "$_i" -lt 6 ]; do
+		sleep 2
+		_out=$(curl -fsS --max-time 10 --socks5-hostname 127.0.0.1:10809 https://cloudflare.com/cdn-cgi/trace 2>/dev/null) && break
+		_out=""
+		_i=$((_i + 1))
+	done
 	kill "$_pid" 2>/dev/null || true
 	rm -rf "$_d"
 
@@ -948,6 +980,15 @@ cmd_run() {
     You pinned back to an older tag. Pull the newer one, or restore a backup."
 	migrate
 
+	# --- WARP registration depends on nothing else here and is the single
+	# slowest step (about 4s), so start it now and collect it after the dest has
+	# been chosen. First boot pays max(warp, dest) instead of the sum.
+	_warp_pid=""
+	if warp_wanted && [ ! -f "$PROFILE" ]; then
+		warp_register &
+		_warp_pid=$!
+	fi
+
 	# --- where are we? one request, used for both the address and the region ---
 	_trace=$(curl -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null) || _trace=""
 	[ -n "${HOST:-}" ] || HOST=$(printf '%s' "$_trace" | sed -n 's/^ip=//p')
@@ -982,10 +1023,8 @@ cmd_run() {
 	# destroying the volume.
 	[ -s "$USERS" ] || user_add "${USER_NAME:-main}"
 
-	# --- WARP: gated on the profile file, one attempt, never fatal ------
-	if warp_wanted && [ ! -f "$PROFILE" ]; then
-		warp_register || true
-	fi
+	# --- collect the WARP registration started above ---------------------
+	[ -z "$_warp_pid" ] || wait "$_warp_pid" || true
 
 	write_config
 	write_runtime

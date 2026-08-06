@@ -12,15 +12,15 @@ TUN_IFACE=${TUN_IFACE:-tt0}
 
 nft delete table inet transtation 2>/dev/null
 nft delete table ip6 transtation 2>/dev/null
-for p in $(seq 9000 9010); do
-	# Several rules can share one priority and `ip rule del priority N` removes
-	# exactly one, so a single pass leaves the rest behind -- verified on a live
-	# host, where two rules sat at 9003. Bounded so a misbehaving iproute2
-	# cannot spin here.
-	n=0
-	while [ "$n" -lt 20 ] && ip -4 rule del priority "$p" 2>/dev/null; do n=$((n + 1)); done
-	n=0
-	while [ "$n" -lt 20 ] && ip -6 rule del priority "$p" 2>/dev/null; do n=$((n + 1)); done
+# Delete exactly the rules that are there. The previous version probed every
+# priority in the range up to 20 times per address family -- 440 `ip`
+# invocations in the worst case -- because several rules can share a priority
+# and one delete removes one rule. Listing first is both bounded by reality and
+# correct for duplicates: a priority listed twice is deleted twice.
+for f in -4 -6; do
+	ip $f rule list 2>/dev/null | sed -n 's/^\(90[0-9][0-9]\):.*/\1/p' | while read -r p; do
+		ip $f rule del priority "$p" 2>/dev/null
+	done
 done
 ip route flush table 2022 2>/dev/null
 ip -6 route flush table 2022 2>/dev/null

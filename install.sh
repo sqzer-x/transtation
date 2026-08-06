@@ -315,9 +315,10 @@ install_client() {
 			TUN_IFACE=${TUN_IFACE:-tt0}
 			nft delete table inet transtation 2>/dev/null
 			nft delete table ip6 transtation 2>/dev/null
-			for p in $(seq 9000 9010); do
-			  n=0; while [ "$n" -lt 20 ] && ip -4 rule del priority "$p" 2>/dev/null; do n=$((n+1)); done
-			  n=0; while [ "$n" -lt 20 ] && ip -6 rule del priority "$p" 2>/dev/null; do n=$((n+1)); done
+			for f in -4 -6; do
+			  ip $f rule list 2>/dev/null | sed -n 's/^\(90[0-9][0-9]\):.*/\1/p' | while read -r p; do
+			    ip $f rule del priority "$p" 2>/dev/null
+			  done
 			done
 			ip route flush table 2022 2>/dev/null
 			ip -6 route flush table 2022 2>/dev/null

@@ -86,6 +86,32 @@ validate() {
 	# fingerprint is absent, where Xray-based clients would tolerate it.
 	FP=${FP:-chrome}
 	FLOW=${FLOW:-xtls-rprx-vision}
+	# ALLOWLISTS, not pattern checks. These two land inside a JSON document, and
+	# a link is something somebody hands you -- in a chat, on a forum, as a QR
+	# code. Left open, `fp=chrome"},"insecure":true,"utls":{"enabled":true,
+	# "fingerprint":"chrome` renders a config that sing-box happily accepts,
+	# which is how a "friendly" link turns into someone else's server with
+	# certificate checking switched off.
+	case "$FLOW" in
+		xtls-rprx-vision | none | '') ;;
+		*) die "unsupported flow in link: $FLOW (expected xtls-rprx-vision)" ;;
+	esac
+	[ "$FLOW" = none ] && FLOW=""
+	case "$FP" in
+		chrome | firefox | edge | safari | ios | android | random | randomized | 360 | qq) ;;
+		*) die "unsupported uTLS fingerprint in link: $FP" ;;
+	esac
+
+	# Operator-supplied, but the same class of hole and just as cheap to close.
+	printf '%s' "$SOCKS_PORT" | grep -Eq '^[0-9]{1,5}$' &&
+		[ "$SOCKS_PORT" -ge 1 ] && [ "$SOCKS_PORT" -le 65535 ] ||
+		die "SOCKS_PORT must be 1-65535, got: $SOCKS_PORT"
+	if [ -n "${DIRECT_SUFFIXES:-}" ]; then
+		for _d in $(printf '%s' "$DIRECT_SUFFIXES" | tr ',' ' '); do
+			printf '%s' "$_d" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' ||
+				die "DIRECT_SUFFIXES entry is not a domain suffix: $_d"
+		done
+	fi
 
 	# Resolve once, here, so the container's resolver never has to look up the
 	# server name mid-flight -- and so the killswitch's bootstrap rule stays
@@ -122,6 +148,7 @@ json_suffix_array() {
 }
 
 vless_outbound() {
+	if [ -n "$FLOW" ]; then _flow_kv="\"flow\": \"$FLOW\","; else _flow_kv=""; fi
 	cat <<-EOF
 		    {
 		      "type": "vless",
@@ -129,7 +156,7 @@ vless_outbound() {
 		      "server": "$SERVER_IP",
 		      "server_port": $PORT,
 		      "uuid": "$UUID",
-		      "flow": "$FLOW",
+		      $_flow_kv
 		      "packet_encoding": "xudp",
 		      "tls": {
 		        "enabled": true,

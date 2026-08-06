@@ -124,6 +124,23 @@ check "rejects a non-vless scheme" rejects 'https://example.com'
 check "rejects a bad uuid" rejects 'vless://not-a-uuid@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com'
 check "rejects a short pbk" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=tooshort&sid=1c69b566b0480c74&sni=a.com'
 check "rejects an odd-length sid" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=abc&sni=a.com'
+# A share link is something somebody hands you -- in a chat, on a forum, as a
+# QR code. Both of these once rendered a config that sing-box ACCEPTED, which
+# is how a "friendly" link becomes someone else's server with certificate
+# checking turned off.
+check "rejects JSON injection through flow=" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com&flow=xtls-rprx-vision","server":"6.6.6.6","x":"'
+check "rejects JSON injection through fp=" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com&fp=chrome"},"insecure":true,"utls":{"enabled":true,"fingerprint":"chrome'
+check "rejects an unknown uTLS fingerprint" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com&fp=nonesuch'
+
+echo
+echo "== client rejects hostile operator environment =="
+env_rejects() {
+	_out=$(docker run --rm --network none -e TT_URI="$FIXTURE_URI" "$@" "$CLIENT_IMG" check 2>&1) && return 1
+	case "$_out" in *transtation-client:*) return 0 ;; *) return 1 ;; esac
+}
+check "rejects a non-numeric SOCKS_PORT" env_rejects -e 'SOCKS_PORT=1080, "sniff": true'
+check "rejects DIRECT_SUFFIXES that is not a domain list" env_rejects -e 'DIRECT_SUFFIXES=a.com"],"outbound":"direct"},{"x":"'
+
 check "rejects a bad port" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:99999?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com'
 
 echo

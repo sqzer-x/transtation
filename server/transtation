@@ -565,8 +565,11 @@ sni_write() {
 	case "$1" in
 		*apple* | *icloud*) die "Xray warns that apple/icloud targets get your IP blocked by the GFW." ;;
 	esac
+	# The reason is free text built partly from CLIENT_REGION; a newline in it
+	# would inject a second KEY=value line into this file.
+	_r=$(printf '%s' "$2" | tr -d '\n\r')
 	_t=$(mktemp "$DATA/.sni.XXXXXX")
-	printf 'SNI=%s\nSNI_REASON=%s\nSNI_CHOSEN=%s\n' "$1" "$2" "$(date -u +%F)" >"$_t"
+	printf 'SNI=%s\nSNI_REASON=%s\nSNI_CHOSEN=%s\n' "$1" "$_r" "$(date -u +%F)" >"$_t"
 	chmod 600 "$_t"
 	mv -f "$_t" "$SNIFILE"
 }
@@ -683,6 +686,7 @@ cmd_status() {
 	printf '  dest / SNI    %s\n' "$SNI"
 	printf '                %s\n' "${SNI_REASON:-unknown}"
 	printf '  clients       minClientVer=%s\n' "${MIN_CLIENT_VER:-0.0.0}"
+	printf '  identity      created %s\n' "${CREATED:-?}"
 
 	if [ "$WARP" = 1 ] && [ "$WARP_READY" = 0 ]; then
 		printf '  egress        DIRECT -- WARP was requested but is NOT registered.\n'
@@ -710,6 +714,7 @@ cmd_backup() {
 	[ -f "$STATE" ] || die "nothing to back up yet"
 	# sni.chosen is included on purpose: every share link carries `sni=`, so a
 	# restore that re-picked a different dest would invalidate all of them.
+	# shellcheck disable=SC2046  # word splitting is the point: skip absent files
 	tar -cz -C "$DATA" \
 		state.env users.tsv \
 		$([ -f "$SNIFILE" ] && echo sni.chosen) \
@@ -846,6 +851,15 @@ cmd_selftest() {
 		_beats bulk 100 900 0   bulk 100 4400 0
 	_assert "scores never go negative" test "$(sni_score bulk 10 100 1)" = 0
 
+	# Same injection class as the client's link parser, arriving by environment.
+	_env_rejects() {
+		(SNI=www.cloudflare.com DEST="" PORT=443
+			eval "$1=\$2"
+			validate_config_env) >/dev/null 2>&1 && return 1 || return 0
+	}
+	_assert "MIN_CLIENT_VER is not free text" _env_rejects MIN_CLIENT_VER '0.0.0", "show": true, "x": "'
+	_assert "WARP_ENDPOINT must be an IPv4 address and port" _env_rejects WARP_ENDPOINT 'evil.example:2408'
+
 	_sni_rejects() { (sni_write "$1" test) >/dev/null 2>&1 && return 1 || return 0; }
 	_assert "sni_write rejects a non-hostname" _sni_rejects 'not a host; rm -rf /'
 	_assert "sni_write rejects apple targets (Xray warns they get the IP blocked)" \
@@ -875,6 +889,29 @@ cmd_selftest() {
 	echo
 	[ "$_fail" = 0 ] || die "selftest FAILED"
 	echo "selftest passed"
+}
+
+# Everything here is interpolated into the generated JSON. It arrives from the
+# operator rather than from a stranger, but a .env copied off a blog post is not
+# meaningfully more trustworthy than a link someone sends you, and each check is
+# one line. Kept as its own function so the selftest can attack it directly.
+validate_config_env() {
+	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
+		die "SNI must be a hostname, got: $SNI"
+	case "$SNI" in
+		*apple* | *icloud*) die "Xray warns that apple/icloud targets get your IP blocked by the GFW. Pick another SNI." ;;
+	esac
+	DEST=${DEST:-$SNI:443}
+	printf '%s' "$DEST" | grep -Eq '^[A-Za-z0-9.-]+:[0-9]{1,5}$' || die "DEST must be host:port, got: $DEST"
+	PORT=${PORT:-443}
+	printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] ||
+		die "PORT must be 1-65535, got: $PORT"
+	printf '%s' "${MIN_CLIENT_VER:-0.0.0}" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){0,2}$' ||
+		die "MIN_CLIENT_VER must look like 0.0.0, got: ${MIN_CLIENT_VER:-}"
+	# Deliberately IPv4:port only, never a hostname: resolving the WARP endpoint
+	# is exactly what produced the random IPv6 failures this design removed.
+	printf '%s' "${WARP_ENDPOINT:-$WARP_ENDPOINT_DEFAULT}" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]{1,5}$' ||
+		die "WARP_ENDPOINT must be an IPv4 address and port, got: ${WARP_ENDPOINT:-}"
 }
 
 # --------------------------------------------------------------------- run
@@ -931,18 +968,7 @@ cmd_run() {
 		_picked_now=1
 	fi
 
-	# Validated before anything else touches it: SNI reaches a JSON document,
-	# and a value sourced from a file would otherwise be a shell injection.
-	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
-		die "SNI must be a hostname, got: $SNI"
-	case "$SNI" in
-		*apple* | *icloud*) die "Xray warns that apple/icloud targets get your IP blocked by the GFW. Pick another SNI." ;;
-	esac
-	DEST=${DEST:-$SNI:443}
-	printf '%s' "$DEST" | grep -Eq '^[A-Za-z0-9.-]+:[0-9]{1,5}$' || die "DEST must be host:port, got: $DEST"
-	PORT=${PORT:-443}
-	printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] ||
-		die "PORT must be 1-65535, got: $PORT"
+	validate_config_env
 
 	# The auto-selection already probed and filtered on exactly these criteria,
 	# so re-running the check would just be a second round-trip.

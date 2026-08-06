@@ -168,9 +168,19 @@ or turn WARP off entirely (`WARP=0`) so you egress from your own VPS address.
 If you have a backup, it is one command into a fresh volume:
 
 ```
-docker run --rm -v transtation-data:/data -v /root:/b alpine \
-  tar xzf /b/transtation-backup.tgz -C /data
+cd /opt/transtation && docker compose down
+transtation restore /root/transtation-backup.tgz
+docker compose up -d && transtation verify
 ```
+
+This started life as a documented `tar` one-liner and failed twice in testing,
+so it is a command now. Getting it right by hand means knowing that Docker
+seeds a fresh named volume with the ownership of the image directory it is
+first mounted into — so unpacking with a generic image leaves `/data` owned by
+root and the server refuses to start — *and* that the backup is mode 0600, so
+the unpacking container has to run as root to read it at all. `restore` also
+refuses to run while the server is up, and refuses a file that is not a
+transtation backup.
 
 If you do not, there is nothing to recover: a new install generates a new
 keypair, and every previously issued link is dead. Run `transtation backup` now

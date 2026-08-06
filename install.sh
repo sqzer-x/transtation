@@ -24,11 +24,25 @@ IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 
-DIR=/opt/transtation
+DIR=${TT_DIR:-/opt/transtation}
 URI_DIR=/etc/transtation
 RAW=https://raw.githubusercontent.com/sqzer-x/transtation/$VERSION
 
 say() { printf '%s\n' "$*"; }
+# Under `curl | sh` stdin is the script itself, so a bare `read` swallows the
+# rest of this file. Under cron or CI there is no /dev/tty at all. Try the
+# terminal, fall back to stdin, and treat "neither" as no answer.
+ask() {
+	printf '%s' "$1"
+	REPLY=""
+	# `[ -r /dev/tty ]` is not enough: the node exists and looks readable even
+	# with no controlling terminal, and opening it then fails with ENXIO and
+	# prints to stderr. Try the open for real, suppress it, fall back to stdin.
+	if { read -r REPLY </dev/tty; } 2>/dev/null && [ -n "$REPLY" ]; then
+		return 0
+	fi
+	read -r REPLY 2>/dev/null || REPLY=""
+}
 step() { printf '  %-14s%s\n' "$1" "$2"; }
 die() { printf '\ntranstation: %s\n\n' "$*" >&2; exit 1; }
 
@@ -37,7 +51,7 @@ client_image() { printf '%s:%s%s' "$IMAGE_CLIENT" "$VERSION" "${CLIENT_DIGEST:+@
 
 need_root() {
 	[ "$(id -u)" = 0 ] || die "this needs root. Re-run as root, or with sudo:
-    curl -fsSLO $RAW/install.sh && sudo sh install.sh $*"
+    curl -fsSLO $RAW/install.sh && sudo sh install.sh"
 }
 
 check_arch() {
@@ -132,9 +146,20 @@ install_server() {
 			    # Both BREAK the WARP outbound. See README, "Capabilities".
 			volumes:
 			  transtation-data:
+			    # Pinned. Without an explicit name Docker Compose prefixes it with
+			    # the project name, which comes from the directory -- so the volume
+			    # would be called something else on every host and every documented
+			    # backup, restore and uninstall command would silently address a
+			    # volume that does not exist.
+			    name: transtation-data
 		EOF
 		: >"$DIR/.env"
 		chmod 600 "$DIR/.env"
+		# If PORT came from the environment, write it down. Compose would honour
+		# it for the published port while the container -- which reads only
+		# env_file -- would still think it is 443, and the share link would name
+		# the wrong port.
+		[ -n "${PORT:-}" ] && printf 'PORT=%s\n' "$PORT" >>"$DIR/.env"
 		step config "wrote $DIR/docker-compose.yml and $DIR/.env"
 	fi
 	[ -n "$SERVER_DIGEST" ] || say "                 note: image pinned by tag, not digest (unreleased build)"
@@ -147,7 +172,7 @@ install_server() {
 	say "pulled $(server_image)"
 
 	printf '  %-14s' start
-	docker compose -f "$DIR/docker-compose.yml" --project-directory "$DIR" up -d >/dev/null
+	docker compose -f "$DIR/docker-compose.yml" --project-directory "$DIR" up -d >/dev/null 2>&1
 	if ! wait_healthy transtation 120; then
 		say ""
 		say "  The container is up but not healthy yet. Most common causes:"
@@ -210,6 +235,23 @@ install_wrapper() {
 		    \$C exec -T proxy transtation backup > "\$f"
 		    echo "backed up to \$f (mode 0600): reality key, users, WARP account."
 		    ;;
+		  restore)
+		    f=\${2:-}
+		    [ -n "\$f" ] && [ -r "\$f" ] || { echo "usage: transtation restore <backup.tgz>" >&2; exit 1; }
+		    tar tzf "\$f" 2>/dev/null | grep -q '^state.env$' || { echo "\$f does not look like a transtation backup" >&2; exit 1; }
+		    if \$C ps -q proxy 2>/dev/null | grep -q .; then
+		      echo "stop the server first:  cd $DIR && docker compose down" >&2; exit 1
+		    fi
+		    # --user 0 so it can read a 0600 archive; the transtation image so that
+		    # Docker seeds a fresh volume with the right /data ownership; tar then
+		    # restores each file's archived uid.
+		    docker run --rm --user 0 \\
+		      -v transtation-data:/data \\
+		      -v "\$(cd "\$(dirname "\$f")" && pwd)":/b:ro \\
+		      --entrypoint sh $(server_image) \\
+		      -c "tar xzf /b/\$(basename "\$f") -C /data"
+		    echo "restored. start it again:  cd $DIR && docker compose up -d"
+		    ;;
 		  logs) shift; exec \$C logs "\$@" ;;
 		  up|down|pull|restart) exec \$C "\$@" ;;
 		  *) exec \$C exec proxy transtation "\$@" ;;
@@ -240,8 +282,10 @@ install_client() {
 
 	if [ -z "$_uri" ] && [ ! -r "$URI_DIR/uri" ]; then
 		say "  paste the link from your server (run 'transtation show' there):"
-		printf '  > '
-		read -r _uri
+		ask '  > '
+		_uri=$REPLY
+		[ -n "$_uri" ] || die "no link given. Pass it as an argument instead:
+    sh install.sh client 'vless://...'"
 	fi
 	if [ -n "$_uri" ]; then
 		mkdir -p "$URI_DIR"
@@ -258,10 +302,11 @@ install_client() {
 
 	if [ "$_tun" = 1 ]; then
 		step mode "tun -- whole-host transparent tunnel"
+		set --
+		[ -n "${DIRECT_SUFFIXES:-}" ] && set -- -e "DIRECT_SUFFIXES=$DIRECT_SUFFIXES"
 		docker run -d --name transtation-client --restart unless-stopped \
 			--network host --cap-add NET_ADMIN --device /dev/net/tun \
-			-e MODE=tun \
-			${DIRECT_SUFFIXES:+-e DIRECT_SUFFIXES="$DIRECT_SUFFIXES"} \
+			-e MODE=tun "$@" \
 			-v "$URI_DIR":"$URI_DIR":ro \
 			"$(client_image)" >/dev/null
 		install -Dm0755 /dev/stdin /usr/local/sbin/transtation-panic <<-'EOF'
@@ -336,10 +381,17 @@ uninstall() {
 		rm -f "$DIR/docker-compose.yml" "$DIR/.env" /usr/local/bin/transtation
 		rmdir "$DIR" 2>/dev/null || true
 		say "server removed."
-		printf 'also delete the data volume? That destroys your Reality key and every issued link. [y/N] '
-		read -r a
-		case "$a" in
-			y | Y) docker volume rm transtation-data >/dev/null 2>&1 && say "volume deleted." ;;
+		ask 'also delete the data volume? That destroys your Reality key and every issued link. [y/N] '
+		say ""
+		case "$REPLY" in
+			y | Y)
+				if docker volume rm transtation-data >/dev/null 2>&1; then
+					say "volume deleted."
+				else
+					say "could not delete the volume (in use, or already gone):"
+					docker volume ls --format '  {{.Name}}' | grep transtation || say "  none found"
+				fi
+				;;
 			*) say "volume kept: 'docker volume ls | grep transtation-data'" ;;
 		esac
 	fi

@@ -236,7 +236,7 @@ what you want to change; every value is read fresh on each boot.
 |---|---|---|
 | `PORT` | `443` | public port |
 | `HOST` | auto-detected | address that goes into the share link |
-| `SNI` | `dl.google.com` | the site your server impersonates |
+| `SNI` | *auto-selected* | the site your server impersonates — leave unset |
 | `DEST` | `$SNI:443` | where the handshake is forwarded |
 | `WARP` | `1` | `0` to egress from the VPS IP instead |
 | `WARP_ENDPOINT` | `162.159.192.1:2408` | override if this anycast address does not handshake |
@@ -244,20 +244,53 @@ what you want to change; every value is read fresh on each boot.
 | `MIN_CLIENT_VER` | `0.0.0` | Reality client version floor |
 | `SKIP_DEST_CHECK` | `0` | skip the startup TLS probe of `$SNI` |
 
-**Choosing an SNI matters more than anything else here**, for two independent
-reasons.
+### The dest picks itself
 
-*Camouflage.* Pick a high-reputation site that speaks TLS 1.3 + X25519, is
-plausibly popular where your server lives, and ideally sits in the same cloud or
-ASN. A Tokyo VPS borrowing a Japanese site's handshake looks ordinary; borrowing
-a Brazilian bank's does not. Apple and iCloud domains are rejected outright —
-Xray itself warns that they get your IP blocked by the GFW.
+The single most important setting is which real site your server impersonates,
+so transtation chooses it for you on first boot — the way a commercial VPN
+picks your nearest exit rather than making you read a server list.
 
-*Certificate size.* **Above roughly 5200 bytes of certificate chain the REALITY
-handshake does not complete**, and the failure is silent in the worst way: the
-container reports healthy, the port listens, and every client is quietly handed
-the real website instead of your proxy. Measured end to end against Xray
-26.3.27:
+It reads the server's own country from `cloudflare.com/cdn-cgi/trace`, then
+probes same-region candidates alongside always-available anycast ones, in
+parallel, and scores what survives:
+
+- **hard filter** — the handshake must succeed, it must be TLS 1.3, and the
+  certificate chain must be comfortably under the size where REALITY breaks
+- **latency** — the measured TLS handshake time, because your server re-dials
+  this site on every single client connection
+- **region bonus** — a same-region candidate wins ties up to 120 ms. This is not
+  cosmetic: matching the dest to the server's own region and ASN is what makes
+  the traffic look ordinary to a DPI box that has already taken an interest in
+  the address.
+
+From a Korean VPS it picks a Korean site at 61 ms over `dl.google.com` at
+164 ms; from a German one it will not.
+
+```
+$ transtation sni
+  sni     www.kakaocorp.com
+  why     best of KR-region and global candidates: 61ms TLS handshake, 884-byte certificate chain
+  since   2026-08-06
+```
+
+**The choice is sticky.** It lives in the data volume and is never re-picked on
+its own, because every share link carries `sni=` — silently changing it would
+break every client you have already handed out. Re-picking is explicit, and
+says so:
+
+```
+transtation sni auto        # probe again and re-pick   (invalidates links)
+transtation sni <domain>    # set by hand               (invalidates links)
+```
+
+Setting `SNI=` in `.env` overrides all of it, permanently.
+
+### Why the size of a certificate matters
+
+**Above roughly 5200 bytes of certificate chain the REALITY handshake does not
+complete**, and the failure is silent in the worst way: the container reports
+healthy, the port listens, and every client is quietly handed the real website
+instead of your proxy. Measured end to end against Xray 26.3.27:
 
 | dest | chain | | dest | chain |
 |---|---|---|---|---|
@@ -267,7 +300,8 @@ the real website instead of your proxy. Measured end to end against Xray
 | `addons.mozilla.org` | 2843 ✓ | | `www.microsoft.com` | 5879 ✗ |
 | `www.nicovideo.jp` | 3822 ✓ | | | |
 
-transtation warns at startup when the chain is too big, and
+The auto-selection filters on this, so you only meet it if you override `SNI`
+yourself. When you do:
 
 ```
 transtation verify
@@ -275,10 +309,11 @@ transtation verify
 
 does a genuine REALITY handshake against the server's own inbound. It is the
 only check that proves clients can actually connect — the healthcheck goes
-through a loopback inbound and never touches REALITY at all. Run it after
-changing `SNI`. `install.sh` runs it for you and refuses to finish if it fails.
+through a loopback inbound and never touches REALITY at all. `install.sh` runs
+it for you and refuses to finish if it fails.
 
-To inspect a candidate yourself:
+Apple and iCloud domains are rejected outright — Xray warns that they get your
+IP blocked by the GFW. To inspect a candidate yourself:
 
 ```
 docker compose exec proxy xray tls ping example.com

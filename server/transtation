@@ -25,11 +25,17 @@ set_paths() {
 	RUNTIME="$DATA/runtime.env"
 	ACCOUNT="$DATA/wgcf-account.toml"
 	PROFILE="$DATA/wgcf-profile.conf"
+	SNIFILE="$DATA/sni.chosen"
 }
 set_paths
 
 die() { printf 'transtation: %s\n' "$*" >&2; exit 1; }
 warn() { printf 'transtation: %s\n' "$*" >&2; }
+
+# Read KEY from a KEY=value file. Never `.`-source these: the values include
+# free text such as "best of KR-region candidates", and sourcing that runs `of`
+# as a command. Parsing also means a tampered state file cannot execute code.
+kv() { sed -n "s/^$2=//p" "$1" 2>/dev/null | head -1; }
 
 # ---------------------------------------------------------------- identity
 
@@ -275,33 +281,57 @@ write_runtime() {
 	# Derived, rewritten every boot. `show`/`status`/`health` run as separate
 	# `docker exec` processes and would otherwise not see an auto-detected HOST.
 	_t=$(mktemp "$DATA/.runtime.XXXXXX")
-	printf 'HOST=%s\nPORT=%s\nSNI=%s\nDEST=%s\nWARP=%s\nWARP_READY=%s\n' \
-		"$HOST" "$PORT" "$SNI" "$DEST" "${WARP:-1}" "$(warp_ready && echo 1 || echo 0)" >"$_t"
+	printf 'HOST=%s\nPORT=%s\nSNI=%s\nDEST=%s\nWARP=%s\nWARP_READY=%s\nSNI_REASON=%s\n' \
+		"$HOST" "$PORT" "$SNI" "$DEST" "${WARP:-1}" "$(warp_ready && echo 1 || echo 0)" \
+		"${SNI_REASON:-unknown}" >"$_t"
 	chmod 600 "$_t"
 	mv -f "$_t" "$RUNTIME"
 }
 
 load_runtime() {
 	[ -f "$RUNTIME" ] || die "server has not started yet -- run 'docker compose up -d' first"
-	# shellcheck source=/dev/null
-	. "$RUNTIME"
+	HOST=$(kv "$RUNTIME" HOST)
+	PORT=$(kv "$RUNTIME" PORT)
+	SNI=$(kv "$RUNTIME" SNI)
+	DEST=$(kv "$RUNTIME" DEST)
+	WARP=$(kv "$RUNTIME" WARP)
+	WARP_READY=$(kv "$RUNTIME" WARP_READY)
+	SNI_REASON=$(kv "$RUNTIME" SNI_REASON)
+}
+
+load_state() {
+	[ -s "$STATE" ] || die "no identity yet -- start the server first"
+	SCHEMA=$(kv "$STATE" SCHEMA)
+	REALITY_PRIV=$(kv "$STATE" REALITY_PRIV)
+	REALITY_PUB=$(kv "$STATE" REALITY_PUB)
+	CREATED=$(kv "$STATE" CREATED)
 }
 
 apply() {
-	# `user add` / `warp register` arrive as separate `docker exec` processes with
-	# none of run()'s shell state, so reload both halves before re-rendering.
-	# shellcheck source=/dev/null
-	. "$STATE"
+	# `user add` / `sni` / `warp register` arrive as separate `docker exec`
+	# processes with none of run()'s shell state, so rebuild it before
+	# re-rendering -- including the SNI precedence, or changing the dest would
+	# write a config that still names the old one.
+	_sni_env=${SNI:-}
+	_dest_env=${DEST:-}
+	load_state
 	load_runtime
+	if [ -n "$_sni_env" ]; then
+		SNI=$_sni_env
+	elif [ -s "$SNIFILE" ]; then
+		sni_load
+	fi
+	DEST=${_dest_env:-$SNI:443}
 	write_config
+	write_runtime
 	if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = xray ]; then
 		# Xray has no reload signal and no config watcher, so the file is the
 		# source of truth and the only way to apply it is to restart. Stopping
 		# PID 1 stops the container; Docker's restart policy brings it back.
 		echo "applying: stopping xray so your restart policy brings it back up."
 		echo "  existing connections drop and clients reconnect on their own."
-		echo "  If you started this container WITHOUT a restart policy, start it again:"
-		echo "    docker start \$(hostname)"
+		printf '  If you started this container WITHOUT a restart policy, start it again:\n'
+		printf '    docker start %s\n' "$(hostname)"
 		kill -TERM 1
 	else
 		echo "written; takes effect the next time the container starts"
@@ -319,8 +349,7 @@ share_uri() {
 }
 
 cmd_show() {
-	# shellcheck source=/dev/null
-	. "$STATE"
+	load_state
 	load_runtime
 	[ -f "$USERS" ] || die "no users yet"
 	_want=${1:-}
@@ -386,12 +415,138 @@ check_dest() {
 	fi
 }
 
+# ------------------------------------------------------- SNI auto-selection
+
+# Candidates are filtered well below CHAIN_LIMIT so that a site adding one
+# intermediate certificate later does not silently break the server.
+CHAIN_SAFE=4500
+# How much slower a same-region candidate may be and still beat the best global
+# one. Region matching is not cosmetic: matching the dest to the server's own
+# region and ASN is what makes the traffic look ordinary to a DPI box that is
+# already suspicious of the address.
+REGION_BONUS_MS=120
+
+# Chain sizes measured 2026-08-06; every entry has real headroom under
+# CHAIN_SAFE. Anycast globals are always probed as well, so a region with no
+# entry here still gets a good answer.
+sni_regional() {
+	case "$1" in
+		JP) echo "www.pixiv.net www.nicovideo.jp" ;;
+		KR) echo "www.kakaocorp.com www.daum.net" ;;
+		US | CA) echo "www.reddit.com www.bing.com" ;;
+		GB | IE | DE | FR | NL | SE | NO | DK | FI | PL | IT | ES | PT | CH | AT | BE | CZ | RO | HU | GR) echo "www.spotify.com www.booking.com" ;;
+		SG | HK | TW | MY | TH | VN | ID | PH) echo "www.grab.com www.lazada.sg" ;;
+		IN | PK | BD | LK) echo "www.hotstar.com www.flipkart.com" ;;
+		BR | AR | CL | MX | CO | PE | UY) echo "www.uol.com.br www.mercadolibre.com" ;;
+		*) echo "" ;;
+	esac
+}
+SNI_GLOBAL="dl.google.com www.cloudflare.com addons.mozilla.org one.one.one.one"
+SNI_FALLBACK=dl.google.com
+
+# One candidate: technical filter, then latency. Writes "score domain chain rtt"
+# to its own file so parallel probes cannot interleave.
+sni_probe() {
+	_c=$1 _bonus=$2 _dir=$3
+	_p=$(timeout 12 xray tls ping "$_c" 2>&1) || return 0
+	case "$_p" in *"Handshake succeeded"*) ;; *) return 0 ;; esac
+	case "$_p" in *"TLS Version:"*"1.3"*) ;; *) return 0 ;; esac
+	_chain=$(printf '%s' "$_p" | sed -n "s/^Certificate chain's total length: *\([0-9][0-9]*\).*/\1/p" | head -1)
+	[ -n "$_chain" ] && [ "$_chain" -le "$CHAIN_SAFE" ] || return 0
+	# busybox date has no %N, so time the TLS handshake with curl instead.
+	_t=$(curl -sS -o /dev/null --max-time 8 -w '%{time_appconnect}' "https://$_c/" 2>/dev/null) || return 0
+	_ms=$(printf '%s' "$_t" | awk '{ printf "%d", $1 * 1000 }')
+	[ -n "$_ms" ] && [ "$_ms" -gt 0 ] || return 0
+	_score=$((_ms - _bonus))
+	[ "$_score" -lt 0 ] && _score=0
+	printf '%s %s %s %s\n' "$_score" "$_c" "$_chain" "$_ms" >"$_dir/$_c"
+}
+
+# Picks the dest this server should impersonate, then STICKS to it. The choice
+# is persisted because every share link carries `sni=`: silently picking a
+# different dest on a later boot would break every client already configured.
+sni_auto() {
+	_loc=${1:-}
+	_dir=$(mktemp -d)
+	printf 'selecting the best dest for this server'
+	[ -n "$_loc" ] && printf ' (region %s)' "$_loc"
+	printf ' ...\n'
+
+	for _c in $(sni_regional "$_loc"); do sni_probe "$_c" "$REGION_BONUS_MS" "$_dir" & done
+	for _c in $SNI_GLOBAL; do sni_probe "$_c" 0 "$_dir" & done
+	wait
+
+	_best=$(cat "$_dir"/* 2>/dev/null | sort -n | head -1)
+	rm -rf "$_dir"
+
+	if [ -n "$_best" ]; then
+		set -- $_best
+		_sni=$2 _chain=$3 _rtt=$4
+		case " $(sni_regional "$_loc") " in
+			*" $_sni "*) _why="best of ${_loc:-?}-region and global candidates" ;;
+			*) _why="best global candidate${_loc:+ (no region list for $_loc)}" ;;
+		esac
+		_reason="$_why: ${_rtt}ms TLS handshake, ${_chain}-byte certificate chain"
+	else
+		_sni=$SNI_FALLBACK
+		_reason="FALLBACK -- no candidate could be probed (no network yet?). Re-run: transtation sni auto"
+	fi
+
+	sni_write "$_sni" "$_reason"
+	printf '  chose %s -- %s\n' "$_sni" "$_reason"
+}
+
+sni_write() {
+	printf '%s' "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
+		die "not a hostname: $1"
+	case "$1" in
+		*apple* | *icloud*) die "Xray warns that apple/icloud targets get your IP blocked by the GFW." ;;
+	esac
+	_t=$(mktemp "$DATA/.sni.XXXXXX")
+	printf 'SNI=%s\nSNI_REASON=%s\nSNI_CHOSEN=%s\n' "$1" "$2" "$(date -u +%F)" >"$_t"
+	chmod 600 "$_t"
+	mv -f "$_t" "$SNIFILE"
+}
+
+sni_load() {
+	SNI=$(kv "$SNIFILE" SNI)
+	SNI_REASON=$(kv "$SNIFILE" SNI_REASON)
+	SNI_CHOSEN=$(kv "$SNIFILE" SNI_CHOSEN)
+	[ -n "$SNI" ] || die "$SNIFILE is empty or corrupt -- fix it with: transtation sni auto"
+}
+
+cmd_sni() {
+	case "${1:-}" in
+		'')
+			[ -s "$SNIFILE" ] || die "no stored selection -- the SNI is coming from your .env, or the server has not started yet"
+			sni_load
+			printf '  sni     %s\n  why     %s\n  since   %s\n' "$SNI" "${SNI_REASON:-?}" "${SNI_CHOSEN:-?}"
+			;;
+		auto | *.*)
+			[ -z "${SNI:-}" ] || warn "SNI is set in your .env; that overrides whatever is stored here."
+			cat >&2 <<-'EOF'
+				Changing the dest invalidates every share link already issued: clients send
+				the old name in their ClientHello and the server will no longer answer to it.
+				Re-issue them afterwards with 'transtation show'.
+			EOF
+			if [ "$1" = auto ]; then
+				_loc=$(curl -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p')
+				sni_auto "$_loc"
+			else
+				sni_write "$1" "set by hand"
+				printf '  set to %s\n' "$1"
+			fi
+			apply
+			;;
+		*) die "usage: transtation sni [auto | <domain>]" ;;
+	esac
+}
+
 # The only check that exercises the actual REALITY path. The healthcheck cannot:
 # it goes through the loopback SOCKS inbound and never touches REALITY at all,
 # so a broken dest passes it forever.
 cmd_verify() {
-	# shellcheck source=/dev/null
-	. "$STATE"
+	load_state
 	load_runtime
 	[ -s "$USERS" ] || die "no users"
 	_u=$(head -1 "$USERS" | cut -f2)
@@ -459,11 +614,11 @@ cmd_health() {
 }
 
 cmd_status() {
-	# shellcheck source=/dev/null
-	. "$STATE"
+	load_state
 	load_runtime
 	printf '\n  server        %s:%s\n' "$HOST" "$PORT"
 	printf '  dest / SNI    %s\n' "$SNI"
+	printf '                %s\n' "${SNI_REASON:-unknown}"
 	printf '  clients       minClientVer=%s\n' "${MIN_CLIENT_VER:-0.0.0}"
 
 	if [ "$WARP" = 1 ] && [ "$WARP_READY" = 0 ]; then
@@ -490,8 +645,11 @@ cmd_status() {
 cmd_backup() {
 	# stdout only -- the caller decides where it lands and with what umask.
 	[ -f "$STATE" ] || die "nothing to back up yet"
+	# sni.chosen is included on purpose: every share link carries `sni=`, so a
+	# restore that re-picked a different dest would invalidate all of them.
 	tar -cz -C "$DATA" \
 		state.env users.tsv \
+		$([ -f "$SNIFILE" ] && echo sni.chosen) \
 		$([ -f "$ACCOUNT" ] && echo wgcf-account.toml) \
 		$([ -f "$PROFILE" ] && echo wgcf-profile.conf)
 }
@@ -501,7 +659,7 @@ cmd_reset() {
 		"refusing. This destroys your Reality keypair and every issued link.
     If you are certain:
       docker compose run --rm -e I_UNDERSTAND_THIS_DESTROYS_MY_KEYS=yes proxy reset"
-	rm -f "$STATE" "$USERS" "$CONF" "$RUNTIME" "$ACCOUNT" "$PROFILE"
+	rm -f "$STATE" "$USERS" "$CONF" "$RUNTIME" "$ACCOUNT" "$PROFILE" "$SNIFILE"
 	echo "identity destroyed. The next start provisions a brand new server."
 }
 
@@ -535,8 +693,7 @@ cmd_selftest() {
 
 	# 2. real key generation reaches the 43-char assert.
 	provision_identity
-	# shellcheck source=/dev/null
-	. "$STATE"
+	load_state
 	_assert "generated x25519 keypair is 43 chars each" \
 		test "${#REALITY_PRIV}${#REALITY_PUB}" = "4343"
 
@@ -587,7 +744,26 @@ cmd_selftest() {
 	_assert "two users produce two clients and two shortIds" \
 		_jq '(.inbounds[0].settings.clients | length) == 2 and (.inbounds[0].streamSettings.realitySettings.shortIds | length) == 2'
 
-	# 6. share URI completeness.
+	# 6. SNI auto-selection: table sanity and the write-side trust boundary.
+	_has() { case " $(sni_regional "$1") " in *" $2 "*) return 0 ;; *) return 1 ;; esac; }
+	_empty_region() { [ -z "$(sni_regional "$1")" ]; }
+	_assert "regional table resolves a known country" _has KR www.kakaocorp.com
+	_assert "regional table is empty for an unlisted country" _empty_region ZZ
+	_assert "the fallback dest is itself a probed global candidate" \
+		sh -c "case ' $SNI_GLOBAL ' in *' $SNI_FALLBACK '*) exit 0 ;; *) exit 1 ;; esac"
+	_sni_rejects() { (sni_write "$1" test) >/dev/null 2>&1 && return 1 || return 0; }
+	_assert "sni_write rejects a non-hostname" _sni_rejects 'not a host; rm -rf /'
+	_assert "sni_write rejects apple targets (Xray warns they get the IP blocked)" \
+		_sni_rejects www.apple.com
+	sni_write www.cloudflare.com "a reason with spaces and 'quotes'"
+	sni_load
+	_assert "sni_write round-trips through sni_load" test "$SNI" = www.cloudflare.com
+	_assert "a reason containing spaces survives" \
+		sh -c "case \"$SNI_REASON\" in *spaces*) exit 0 ;; *) exit 1 ;; esac"
+	_perm600b() { [ "$(stat -c %a "$SNIFILE" 2>/dev/null)" = 600 ]; }
+	_assert "sni.chosen is 0600" _perm600b
+
+	# 7. share URI completeness.
 	_u=$(head -1 "$USERS" | cut -f2)
 	_s=$(head -1 "$USERS" | cut -f3)
 	_uri=$(share_uri alice "$_u" "$_s")
@@ -611,7 +787,7 @@ cmd_selftest() {
 banner() {
 	printf '\n  transtation -- listening on 0.0.0.0:%s inside the container\n' "$INTERNAL_PORT"
 	printf '  server        %s:%s\n' "$HOST" "$PORT"
-	printf '  dest / SNI    %s\n' "$SNI"
+	printf '  dest / SNI    %s  (%s)\n' "$SNI" "${SNI_REASON:-unknown}"
 	if [ "${WARP:-1}" = 1 ] && ! warp_ready; then
 		printf '  egress        DIRECT -- WARP requested but NOT registered (see the warning above)\n'
 	elif warp_ready; then
@@ -634,17 +810,34 @@ cmd_run() {
 
 	# --- identity: gated on its own artifact, written last and atomically ---
 	[ -s "$STATE" ] || provision_identity
-	# shellcheck source=/dev/null
-	. "$STATE"
+	load_state
 	[ "${SCHEMA:-0}" -le "$SCHEMA_SUPPORTED" ] || die \
 		"data schema $SCHEMA is newer than this image supports ($SCHEMA_SUPPORTED).
     You pinned back to an older tag. Pull the newer one, or restore a backup."
 	migrate
 
-	# --- config: read from the environment every boot, never persisted ---
-	SNI=${SNI:-dl.google.com}
-	# Validated before anything else touches it: SNI reaches a JSON document and
-	# an unvalidated value sourced from a file would be a shell injection.
+	# --- where are we? one request, used for both the address and the region ---
+	_trace=$(curl -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null) || _trace=""
+	[ -n "${HOST:-}" ] || HOST=$(printf '%s' "$_trace" | sed -n 's/^ip=//p')
+	[ -n "${HOST:-}" ] || die \
+		"could not auto-detect this host's public address.
+    Set HOST=<your.ip.or.domain> in your .env and start again."
+	LOC=$(printf '%s' "$_trace" | sed -n 's/^loc=//p')
+
+	# --- SNI: env override, else the sticky auto-selection, else pick now ---
+	_picked_now=0
+	if [ -n "${SNI:-}" ]; then
+		SNI_REASON="set in your .env"
+	elif [ -s "$SNIFILE" ]; then
+		sni_load
+	else
+		sni_auto "$LOC"
+		sni_load
+		_picked_now=1
+	fi
+
+	# Validated before anything else touches it: SNI reaches a JSON document,
+	# and a value sourced from a file would otherwise be a shell injection.
 	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
 		die "SNI must be a hostname, got: $SNI"
 	case "$SNI" in
@@ -656,14 +849,9 @@ cmd_run() {
 	printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] ||
 		die "PORT must be 1-65535, got: $PORT"
 
-	if [ -z "${HOST:-}" ]; then
-		HOST=$(curl -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p') || true
-	fi
-	[ -n "${HOST:-}" ] || die \
-		"could not auto-detect this host's public address.
-    Set HOST=<your.ip.or.domain> in your .env and start again."
-
-	[ "${SKIP_DEST_CHECK:-0}" = 1 ] || check_dest
+	# The auto-selection already probed and filtered on exactly these criteria,
+	# so re-running the check would just be a second round-trip.
+	[ "$_picked_now" = 1 ] || [ "${SKIP_DEST_CHECK:-0}" = 1 ] || check_dest
 
 	# --- first user: gated on users.tsv, not on state.env ---------------
 	# This separation is the whole point. If provisioning is interrupted between
@@ -696,6 +884,9 @@ usage() {
 		  health                 exit 0 if traffic (and WARP, if enabled) is getting out
 		  verify                 do a real REALITY handshake against this server -- the
 		                         only check that proves clients can actually connect
+		  sni                    show which dest this server impersonates, and why
+		  sni auto               re-run the selection (invalidates existing links)
+		  sni <domain>           set the dest by hand (invalidates existing links)
 		  user add <name>        create a user with a fresh UUID and shortId, then apply
 		  user rm <name>         revoke a user, then apply
 		  user ls                list users
@@ -712,6 +903,7 @@ case "${1:-run}" in
 	status) cmd_status ;;
 	health) cmd_health ;;
 	verify) cmd_verify ;;
+	sni) shift; cmd_sni "${1:-}" ;;
 	backup) cmd_backup ;;
 	reset) cmd_reset ;;
 	selftest) cmd_selftest ;;

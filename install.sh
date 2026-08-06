@@ -15,12 +15,12 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.9}
+VERSION=${TT_VERSION:-v1.0.10}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.9, and the hash-verified installer you read would vouch for nothing.
+# v1.0.10, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 
@@ -169,14 +169,26 @@ install_server() {
 		[ -n "${PORT:-}" ] && printf 'PORT=%s\n' "$PORT" >>"$DIR/.env"
 		step config "wrote $DIR/docker-compose.yml and $DIR/.env"
 	fi
-	[ -n "$SERVER_DIGEST" ] || say "                 note: image pinned by tag, not digest (unreleased build)"
 
 	install_wrapper
 	step wrapper "installed /usr/local/bin/transtation"
 
 	printf '  %-14s' image
-	docker compose -f "$DIR/docker-compose.yml" --project-directory "$DIR" pull -q 2>/dev/null || true
-	say "pulled $(server_image)"
+	docker pull -q "$(server_image)" >/dev/null 2>&1 || true
+	# Resolve the tag to the digest it points at *now* and pin the compose file
+	# to that. A tag is mutable; once this is written, `docker compose up` can
+	# only ever start the exact image this install verified. Rewritten on every
+	# run so re-running the installer is still how you upgrade.
+	_ref=$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' "$(server_image)" 2>/dev/null)
+	case "$_ref" in
+		*@sha256:*)
+			sed -i "s|^\( *image: \).*|\1$_ref|" "$DIR/docker-compose.yml"
+			say "pinned to ${_ref#*@}"
+			;;
+		*)
+			say "pulled $(server_image) (no digest available; the compose file pins by tag)"
+			;;
+	esac
 
 	printf '  %-14s' start
 	docker compose -f "$DIR/docker-compose.yml" --project-directory "$DIR" up -d >/dev/null 2>&1

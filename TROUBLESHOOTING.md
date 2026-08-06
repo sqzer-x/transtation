@@ -140,7 +140,9 @@ If `transtation-panic` is not installed, the same thing by hand:
 ```
 sudo nft delete table inet transtation
 # several rules can share one priority, so delete until each one is empty
-for p in $(seq 9000 9010); do while sudo ip rule del priority $p 2>/dev/null; do :; done; done
+for p in $(seq 9000 9010); do
+  while sudo ip rule del priority $p 2>/dev/null; do :; done
+done
 sudo ip link del tt0
 ```
 

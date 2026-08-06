@@ -41,7 +41,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     strategy:
       matrix:
@@ -90,3 +90,27 @@ jobs:
       # pins the image by content, not by a mutable tag.
       - name: digest
         run: echo "${{ matrix.name }} -> ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # The README tells people to check install.sh against a hash in the release
+      # notes, so the release notes have to exist and have to carry that hash.
+      - name: publish the release notes with the installer hash
+        if: matrix.name == 'transtation'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sum=$(sha256sum install.sh | cut -d" " -f1)
+          {
+            echo "\`\`\`"
+            echo "$sum  install.sh"
+            echo "\`\`\`"
+            echo
+            echo "    curl -fsSLO https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/install.sh"
+            echo "    sha256sum install.sh    # must match the line above"
+            echo "    less install.sh"
+            echo "    sudo sh install.sh"
+            echo
+            echo "Images: \`ghcr.io/${{ github.repository_owner }}/transtation:${{ github.ref_name }}\` and \`…/transtation-client:${{ github.ref_name }}\` (amd64, arm64)."
+            echo "The installer resolves the tag to a digest at install time and pins the compose file to it."
+          } > notes.md
+          gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --notes-file notes.md || \
+            gh release edit "${{ github.ref_name }}" --notes-file notes.md

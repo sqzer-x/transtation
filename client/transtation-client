@@ -287,12 +287,13 @@ preflight_tun() {
 panic_banner() {
 	cat <<-EOF
 
-		  ┌─ IF YOUR NETWORK EVER DIES, RUN THIS ─────────────────────────────┐
-		  │   sudo nft delete table inet transtation 2>/dev/null              │
-		  │   for p in \$(seq 9000 9010); do while sudo ip rule del priority \$p;  │
-		  │     do :; done; done                                             │
-		  │   sudo ip link del $TUN_IFACE                                              │
-		  └───────────────────────────────────────────────────────────────────┘
+		  IF YOUR NETWORK EVER DIES, RUN THIS:
+
+		      sudo nft delete table inet transtation
+		      for p in \$(seq 9000 9010); do
+		        while sudo ip rule del priority \$p 2>/dev/null; do :; done
+		      done
+		      sudo ip link del $TUN_IFACE
 		  (or:  sudo transtation-panic  --  or the 'panic' verb of this image)
 
 	EOF

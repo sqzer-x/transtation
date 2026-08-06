@@ -4,8 +4,8 @@ Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
 container on any Linux box that has Docker.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.9/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.9 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.10/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.10 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -45,7 +45,7 @@ transtation exists because of a narrower set of preferences:
 Two-step form above is the recommended one. If you are going to pipe it anyway:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.9/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.10/install.sh | sudo sh
 ```
 
 The installer needs root, refuses anything other than x86_64/aarch64, installs
@@ -59,7 +59,7 @@ If you already run Docker and prefer to do it yourself:
 # /opt/transtation/docker-compose.yml
 services:
   proxy:
-    image: ghcr.io/sqzer-x/transtation:v1.0.9
+    image: ghcr.io/sqzer-x/transtation:v1.0.10
     container_name: transtation
     restart: unless-stopped
     ports: ["443:8443"]
@@ -132,7 +132,7 @@ install -Dm600 /dev/stdin /etc/transtation/uri   # paste the vless:// link, then
 docker run -d --name transtation-client --restart unless-stopped \
   -p 127.0.0.1:1080:1080 \
   -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.9
+  ghcr.io/sqzer-x/transtation-client:v1.0.10
 ```
 
 ```
@@ -144,8 +144,8 @@ The **`h`** in `socks5h` is load-bearing: plain `socks5://` makes curl resolve
 DNS locally and leaks every hostname you visit. In Firefox, tick "Proxy DNS when
 using SOCKS v5".
 
-No capabilities, no devices, no host networking. Works under rootless Docker,
-rootless Podman and Docker Desktop.
+No capabilities, no devices, no host networking, so nothing here needs a
+rootful container runtime — it was run under rootless Podman as well as Docker.
 
 Client-side settings, all optional:
 
@@ -176,7 +176,7 @@ docker run -d --name transtation-client --restart unless-stopped \
   -e MODE=tun \
   -e DIRECT_SUFFIXES=example.com,example.net \
   -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.9
+  ghcr.io/sqzer-x/transtation-client:v1.0.10
 ```
 
 Exactly three extra flags. `--privileged` is **not** needed and must not be
@@ -188,7 +188,8 @@ the container's own network namespace and your host's traffic is untouched.
 not unsupported, it is architecturally incapable. Under rootless Docker or
 Podman it cannot work either: a capability held in a child user namespace does
 not authorise operations on a network namespace owned by the initial one. The
-container detects both cases at startup and says so.
+container tests for that at startup and refuses with the reason rather than
+half-starting.
 
 Be honest with yourself about what this buys: a container with `--network host`
 and `CAP_NET_ADMIN` provides **no isolation whatsoever**, while adding the
@@ -237,9 +238,9 @@ If your network ever dies:
 sudo transtation-panic
 ```
 
-Six lines, no network and no Docker needed. It also exists as a verb of the
-client image (`docker run --rm --network host --cap-add NET_ADMIN <image> panic`),
-and the three raw commands are printed in the client's startup banner every
+Small, and it needs neither a network nor Docker. It also exists as a verb of
+the client image (`docker run --rm --network host --cap-add NET_ADMIN <image>
+panic`), and the same commands are printed in the client's startup banner every
 boot, so they are in `docker logs` and in your scrollback.
 
 ---
@@ -476,8 +477,10 @@ It is a real objection and this project does not wave it away:
 3. **It installs Docker via `get.docker.com`**, a ~780-line third-party script,
    as root. The installer tells you before it does, and skips the step entirely
    if Docker is already present.
-4. **The image tag is mutable.** Release builds pin the image by SHA-256 digest
-   in the compose file, so a retagged image will not be pulled.
+4. **The image tag is mutable.** The installer resolves the tag to the digest
+   it points at during installation and writes *that* into the compose file, so
+   from then on `docker compose up` can only start the exact image the install
+   verified. Re-running the installer is how you move to a newer one.
 
 The Xray binary is verified inside the Dockerfile against the `.dgst` file from
 the same GitHub release. That defends against a bad mirror or a truncated
@@ -491,8 +494,8 @@ Everything below was run, on a Korean client against an AWS Tokyo VPS with the
 host's own proxy stopped, so nothing was measured through a second proxy:
 
 - **Server on a real VPS.** `install.sh` on Ubuntu 24.04: installs Docker,
-  pulls the image, healthy in 12s, `verify` completes a REALITY handshake and
-  reports `warp=on colo=NRT`.
+  pulls and digest-pins the image, and `verify` completes a REALITY handshake
+  reporting `warp=on colo=NRT`.
 - **Client to server across the internet, no tunnels.** Client container in
   Korea to a Tokyo VPS with the host's own proxy stopped, so nothing was
   measured through a second proxy. Steady-state request latency ≈0.20 s,
@@ -511,7 +514,8 @@ host's own proxy stopped, so nothing was measured through a second proxy:
 - **Rootless.** `MODE=proxy` works under rootless Podman. `MODE=tun` there
   refuses with the reason rather than half-starting; under rootful Podman it
   works.
-- **arm64.** The published arm64 image runs its selftest under emulation.
+- **arm64.** The published arm64 image was run as a server under emulation,
+  with a client on the other architecture passing traffic through it.
 - **Timings, measured rather than asserted.** On that VPS: 7.3 s from
   `docker compose up` to healthy on a first boot that generates keys, picks a
   dest and registers with WARP; 14.4 s to a proven-working proxy. Most of the

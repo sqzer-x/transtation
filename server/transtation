@@ -1,0 +1,635 @@
+#!/bin/sh
+# transtation -- self-provisioning VLESS + REALITY proxy server, optional Cloudflare WARP egress.
+# https://github.com/sqzer-x/transtation
+#
+# Everything in /data except config.json and runtime.env is IDENTITY: written
+# once, atomically, and never rewritten. Everything else is DERIVED and
+# regenerated from this image on every boot. That split is what makes an image
+# upgrade safe and a half-finished first boot resumable.
+set -eu
+
+SCHEMA_SUPPORTED=1
+INTERNAL_PORT=8443
+HEALTH_ADDR=127.0.0.1
+HEALTH_PORT=10808
+# Cloudflare's public WARP peer key. Not a secret; identical for every user.
+WARP_PEER_PUBKEY='bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo='
+WARP_ENDPOINT_DEFAULT='162.159.192.1:2408'
+TAB=$(printf '\t')
+
+set_paths() {
+	DATA=${TT_DATA:-/data}
+	STATE="$DATA/state.env"
+	USERS="$DATA/users.tsv"
+	CONF="$DATA/config.json"
+	RUNTIME="$DATA/runtime.env"
+	ACCOUNT="$DATA/wgcf-account.toml"
+	PROFILE="$DATA/wgcf-profile.conf"
+}
+set_paths
+
+die() { printf 'transtation: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'transtation: %s\n' "$*" >&2; }
+
+# ---------------------------------------------------------------- identity
+
+# Xray has shipped three different `xray x25519` output formats:
+#   <=25.6.8   "Private key: <b64>"        / "Public key: <b64>"
+#   25.9-26.1  "PrivateKey: <b64>"         / "Password: <b64>"
+#   >=26.3.27  "PrivateKey: <b64>"         / "Password (PublicKey): <b64>"  + "Hash32: <b64>"
+# Parse by label, never by position. The ^ anchors keep "Password (PublicKey)"
+# from also matching the private rule, and keep Hash32 -- which belongs to VLESS
+# Encryption, not REALITY -- from matching either.
+parse_x25519() {
+	awk -F':[[:space:]]*' '
+		/^Private ?[Kk]ey/            { p = $2 }
+		/^(Public ?[Kk]ey|Password)/  { q = $2 }
+		END { gsub(/[[:space:]]/, "", p); gsub(/[[:space:]]/, "", q); print p " " q }'
+}
+
+provision_identity() {
+	_pair=$(xray x25519 | parse_x25519)
+	_priv=${_pair% *}
+	_pub=${_pair#* }
+	# An x25519 key is 32 bytes in base64url without padding == 43 characters.
+	# This assert is the tripwire for a fourth output format.
+	[ "${#_priv}" -eq 43 ] && [ "${#_pub}" -eq 43 ] || die \
+		"could not parse 'xray x25519' (priv=${#_priv}ch pub=${#_pub}ch).
+    Xray changed its output format. Open an issue with the output of: xray x25519"
+
+	_t=$(mktemp "$DATA/.state.XXXXXX")
+	printf 'SCHEMA=%s\nREALITY_PRIV=%s\nREALITY_PUB=%s\nCREATED=%s\n' \
+		"$SCHEMA_SUPPORTED" "$_priv" "$_pub" "$(date -u +%F)" >"$_t"
+	chmod 600 "$_t"
+	# Atomic. The existence of state.env IS the "identity provisioned" marker,
+	# so it must appear only once everything in it is durable.
+	mv -f "$_t" "$STATE"
+}
+
+migrate() {
+	# case "$SCHEMA" in 1) ...upgrade to 2...;& 2) ...;; esac -- nothing yet.
+	:
+}
+
+# ------------------------------------------------------------------- users
+
+user_add() {
+	_name=${1:?usage: transtation user add <name>}
+	case "$_name" in
+		'' | *[!A-Za-z0-9_-]*) die "name must match [A-Za-z0-9_-]{1,32}" ;;
+	esac
+	[ "${#_name}" -le 32 ] || die "name must be 32 characters or fewer"
+	if [ -f "$USERS" ] && grep -q "^$_name$TAB" "$USERS"; then
+		die "user '$_name' already exists"
+	fi
+	_uuid=$(xray uuid)
+	# 8 random bytes == 16 hex chars, the maximum REALITY accepts. Never "",
+	# which hex-decodes to the same all-zero shortId as "00" and leaves the
+	# public key -- which is printed in every share link you hand out -- as the
+	# only thing gating the handshake.
+	_sid=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
+	umask 077
+	printf '%s\t%s\t%s\n' "$_name" "$_uuid" "$_sid" >>"$USERS"
+	chmod 600 "$USERS"
+	printf 'added user %s\n' "$_name"
+}
+
+user_rm() {
+	_name=${1:?usage: transtation user rm <name>}
+	[ -f "$USERS" ] || die "no users file"
+	grep -q "^$_name$TAB" "$USERS" || die "no such user: $_name"
+	_n=$(wc -l <"$USERS")
+	[ "$_n" -gt 1 ] || die "refusing to remove the last user -- the server cannot start with none"
+	_t=$(mktemp "$DATA/.users.XXXXXX")
+	grep -v "^$_name$TAB" "$USERS" >"$_t"
+	chmod 600 "$_t"
+	mv -f "$_t" "$USERS"
+	printf 'removed user %s (its UUID and shortId are both revoked)\n' "$_name"
+}
+
+user_ls() {
+	[ -f "$USERS" ] || die "no users yet"
+	printf 'NAME\tUUID\n'
+	while IFS="$TAB" read -r n u _; do
+		[ -n "$n" ] || continue
+		printf '%s\t%s\n' "$n" "$u"
+	done <"$USERS"
+}
+
+# ------------------------------------------------------------------ config
+
+warp_wanted() { [ "${WARP:-1}" = 1 ]; }
+warp_ready() { warp_wanted && [ -f "$PROFILE" ]; }
+
+warp_register() {
+	# ONE attempt. Never a retry loop: hammering Cloudflare's registration
+	# endpoint is how a source IP -- historically a whole region -- gets blocked.
+	if wgcf register --accept-tos --config "$ACCOUNT" >/dev/null 2>&1 &&
+		wgcf generate --config "$ACCOUNT" --profile "$PROFILE" >/dev/null 2>&1; then
+		chmod 600 "$ACCOUNT" "$PROFILE"
+		return 0
+	fi
+	rm -f "$PROFILE"
+	warn "Cloudflare WARP registration failed (rate limit, or the API changed).
+    Cloudflare rate-limits registration per source IP for roughly 15 minutes.
+    Continuing with DIRECT egress from this VPS's own IP -- the proxy works.
+      retry:            transtation warp register
+      turn off for good: set WARP=0 in your .env and 'docker compose up -d'"
+	return 1
+}
+
+render_warp_outbound() {
+	_priv=$(sed -n 's/^[[:space:]]*PrivateKey[[:space:]]*=[[:space:]]*//p' "$PROFILE" | head -1)
+	_addrs=$(sed -n 's/^[[:space:]]*Address[[:space:]]*=[[:space:]]*//p' "$PROFILE" | head -1)
+	[ -n "$_priv" ] && [ -n "$_addrs" ] || die "$PROFILE is unreadable or truncated -- try: transtation warp register"
+	_addr_json=$(printf '%s' "$_addrs" | tr ',' '\n' |
+		sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+		awk 'NF { printf "%s\"%s\"", (n++ ? ", " : ""), $0 }')
+	cat <<-EOF
+		    {
+		      "tag": "warp-out",
+		      "protocol": "wireguard",
+		      "settings": {
+		        "secretKey": "$_priv",
+		        "address": [$_addr_json],
+		        "peers": [
+		          {
+		            "publicKey": "$WARP_PEER_PUBKEY",
+		            "endpoint": "${WARP_ENDPOINT:-$WARP_ENDPOINT_DEFAULT}",
+		            "allowedIPs": ["0.0.0.0/0", "::/0"],
+		            "keepAlive": 25
+		          }
+		        ],
+		        "mtu": 1280,
+		        "noKernelTun": true,
+		        "domainStrategy": "ForceIPv4v6"
+		      }
+		    },
+	EOF
+}
+
+# NOTE: this image ships no geoip.dat / geosite.dat (they are 62% of the image
+# and nothing else needed them). Any "geoip:" or "geosite:" rule added below
+# will fail at startup with a file-not-found error. Use literal CIDRs.
+render_config() {
+	_clients=$(awk -F'\t' 'NF>=3 { printf "%s{ \"id\": \"%s\", \"flow\": \"xtls-rprx-vision\" }", (n++ ? ",\n          " : ""), $2 }' "$USERS")
+	_sids=$(awk -F'\t' 'NF>=3 { printf "%s\"%s\"", (n++ ? ", " : ""), $3 }' "$USERS")
+	[ -n "$_clients" ] || die "no users defined -- refusing to render a config REALITY would reject"
+
+	if warp_ready; then
+		_warp_out=$(render_warp_outbound)
+		_final_out=warp-out
+	else
+		_warp_out=""
+		_final_out=direct
+	fi
+
+	cat <<-EOF
+		{
+		  "log": { "loglevel": "warning", "access": "none", "error": "" },
+		  "dns": { "servers": ["1.1.1.1", "1.0.0.1"] },
+		  "inbounds": [
+		    {
+		      "tag": "reality-in",
+		      "listen": "0.0.0.0",
+		      "port": $INTERNAL_PORT,
+		      "protocol": "vless",
+		      "settings": {
+		        "clients": [
+		          $_clients
+		        ],
+		        "decryption": "none"
+		      },
+		      "streamSettings": {
+		        "network": "tcp",
+		        "security": "reality",
+		        "realitySettings": {
+		          "show": false,
+		          "dest": "$DEST",
+		          "xver": 0,
+		          "serverNames": ["$SNI"],
+		          "privateKey": "$REALITY_PRIV",
+		          "shortIds": [$_sids],
+		          "minClientVer": "${MIN_CLIENT_VER:-0.0.0}"
+		        }
+		      },
+		      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "routeOnly": true }
+		    },
+		    {
+		      "tag": "health-in",
+		      "listen": "$HEALTH_ADDR",
+		      "port": $HEALTH_PORT,
+		      "protocol": "socks",
+		      "settings": { "auth": "noauth", "udp": false }
+		    }
+		  ],
+		  "outbounds": [
+		$_warp_out    { "tag": "direct", "protocol": "freedom" },
+		    { "tag": "block", "protocol": "blackhole" }
+		  ],
+		  "routing": {
+		    "domainStrategy": "IPIfNonMatch",
+		    "rules": [
+		      {
+		        "type": "field",
+		        "ip": [
+		          "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+		          "169.254.0.0/16", "100.64.0.0/10",
+		          "::1/128", "fc00::/7", "fe80::/10"
+		        ],
+		        "outboundTag": "block"
+		      },
+		      { "type": "field", "port": "25", "outboundTag": "block" },
+		      { "type": "field", "protocol": ["bittorrent"], "outboundTag": "block" },
+		      { "type": "field", "network": "tcp,udp", "outboundTag": "$_final_out" }
+		    ]
+		  }
+		}
+	EOF
+}
+
+# 169.254.0.0/16 in that block list is load-bearing, not decoration: without it
+# any client of your proxy can reach 169.254.169.254 and read your instance's
+# cloud metadata, including IAM credentials.
+
+write_config() {
+	_t=$(mktemp "$DATA/.config.XXXXXX")
+	render_config >"$_t"
+	jq -e . "$_t" >/dev/null 2>&1 || { rm -f "$_t"; die "generated config is not valid JSON -- this is a transtation bug"; }
+	xray run -test -c "$_t" >/dev/null 2>&1 || {
+		xray run -test -c "$_t" >&2 || true
+		rm -f "$_t"
+		die "generated config was rejected by xray -- this is a transtation bug"
+	}
+	chmod 644 "$_t"
+	mv -f "$_t" "$CONF"
+}
+
+write_runtime() {
+	# Derived, rewritten every boot. `show`/`status`/`health` run as separate
+	# `docker exec` processes and would otherwise not see an auto-detected HOST.
+	_t=$(mktemp "$DATA/.runtime.XXXXXX")
+	printf 'HOST=%s\nPORT=%s\nSNI=%s\nDEST=%s\nWARP=%s\nWARP_READY=%s\n' \
+		"$HOST" "$PORT" "$SNI" "$DEST" "${WARP:-1}" "$(warp_ready && echo 1 || echo 0)" >"$_t"
+	chmod 600 "$_t"
+	mv -f "$_t" "$RUNTIME"
+}
+
+load_runtime() {
+	[ -f "$RUNTIME" ] || die "server has not started yet -- run 'docker compose up -d' first"
+	# shellcheck source=/dev/null
+	. "$RUNTIME"
+}
+
+apply() {
+	# `user add` / `warp register` arrive as separate `docker exec` processes with
+	# none of run()'s shell state, so reload both halves before re-rendering.
+	# shellcheck source=/dev/null
+	. "$STATE"
+	load_runtime
+	write_config
+	if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = xray ]; then
+		echo "restarting xray to apply (existing connections drop; clients reconnect automatically)"
+		kill -TERM 1
+	else
+		echo "written; takes effect the next time the container starts"
+	fi
+}
+
+# ------------------------------------------------------------------ sharing
+
+share_uri() {
+	_name=$1 _uuid=$2 _sid=$3
+	_h=$HOST
+	case "$_h" in *:*) _h="[$_h]" ;; esac
+	printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&spx=%%2F&type=tcp&headerType=none#transtation-%s\n' \
+		"$_uuid" "$_h" "$PORT" "$SNI" "$REALITY_PUB" "$_sid" "$_name"
+}
+
+cmd_show() {
+	# shellcheck source=/dev/null
+	. "$STATE"
+	load_runtime
+	[ -f "$USERS" ] || die "no users yet"
+	_want=${1:-}
+	_found=0
+	while IFS="$TAB" read -r n u s; do
+		[ -n "$n" ] || continue
+		[ -z "$_want" ] || [ "$_want" = "$n" ] || continue
+		_found=1
+		_uri=$(share_uri "$n" "$u" "$s")
+		printf '\n  user: %s\n\n' "$n"
+		printf '  !! The QR and the line below are your credential. Anyone holding either can\n'
+		printf '     use your proxy, and a link that has been published stays fingerprintable\n'
+		printf '     forever. Revoke with:  transtation user rm %s\n\n' "$n"
+		if command -v qrencode >/dev/null 2>&1; then
+			printf '%s' "$_uri" | qrencode -t ANSIUTF8 -m 2
+			printf '\n'
+		fi
+		printf '  %s\n\n' "$_uri"
+	done <"$USERS"
+	[ "$_found" = 1 ] || die "no such user: $_want"
+	# The URI is deliberately never written to container stdout during `run`:
+	# the json-file log driver would persist this credential to
+	# /var/lib/docker/containers/<id>/<id>-json.log, where it survives in every
+	# log bundle anyone ever pastes into a support thread.
+	printf '  This link was NOT written to the container log.\n\n'
+}
+
+# ------------------------------------------------------------------- health
+
+trace() { curl -fsS --max-time 8 --socks5-hostname "$HEALTH_ADDR:$HEALTH_PORT" https://cloudflare.com/cdn-cgi/trace; }
+
+cmd_health() {
+	load_runtime
+	_t=$(trace) || { echo "no egress at all through the proxy"; exit 1; }
+	if [ "$WARP_READY" = 1 ]; then
+		echo "$_t" | grep -qx 'warp=on' || {
+			cat >&2 <<-'EOF'
+				Reality is up, but the WARP tunnel is not passing traffic.
+				  - some VPS providers block outbound UDP/2408 (registration is TCP, so it
+				    succeeded anyway and this only shows up now)
+				  - if you added --cap-add NET_ADMIN, REMOVE it. It makes Xray try kernel TUN,
+				    which fails on Docker's read-only /proc/sys with no fallback to userspace.
+				  fix: set WARP=0 in your .env and run 'docker compose up -d'. The proxy works
+				       without WARP; it just egresses from this VPS's own IP.
+			EOF
+			exit 1
+		}
+	fi
+	exit 0
+}
+
+cmd_status() {
+	# shellcheck source=/dev/null
+	. "$STATE"
+	load_runtime
+	printf '\n  server        %s:%s\n' "$HOST" "$PORT"
+	printf '  dest / SNI    %s\n' "$SNI"
+	printf '  clients       minClientVer=%s\n' "${MIN_CLIENT_VER:-0.0.0}"
+
+	if [ "$WARP" = 1 ] && [ "$WARP_READY" = 0 ]; then
+		printf '  egress        DIRECT -- WARP was requested but is NOT registered.\n'
+		printf '                Every packet leaves from this VPS IP. Fix: transtation warp register\n'
+	elif _t=$(trace 2>/dev/null); then
+		printf '  egress        %s\n' "$(echo "$_t" | grep -E '^(ip|colo|loc|warp)=' | tr '\n' ' ')"
+	else
+		printf '  egress        UNREACHABLE -- no traffic is getting out through the proxy\n'
+	fi
+
+	if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = xray ]; then
+		printf '  xray          running\n'
+	else
+		printf '  xray          NOT running as PID 1\n'
+	fi
+	printf '  users         %s\n' "$(awk -F'\t' 'NF>=3{printf "%s%s", (n++?", ":""), $1}' "$USERS" 2>/dev/null)"
+	printf '  inbound       not verifiable from this host. If clients time out with no server\n'
+	printf '                log line, open TCP %s in your provider firewall / security group.\n\n' "$PORT"
+}
+
+# ------------------------------------------------------------------ backup
+
+cmd_backup() {
+	# stdout only -- the caller decides where it lands and with what umask.
+	[ -f "$STATE" ] || die "nothing to back up yet"
+	tar -cz -C "$DATA" \
+		state.env users.tsv \
+		$([ -f "$ACCOUNT" ] && echo wgcf-account.toml) \
+		$([ -f "$PROFILE" ] && echo wgcf-profile.conf)
+}
+
+cmd_reset() {
+	[ "${I_UNDERSTAND_THIS_DESTROYS_MY_KEYS:-}" = yes ] || die \
+		"refusing. This destroys your Reality keypair and every issued link.
+    If you are certain:
+      docker compose run --rm -e I_UNDERSTAND_THIS_DESTROYS_MY_KEYS=yes proxy reset"
+	rm -f "$STATE" "$USERS" "$CONF" "$RUNTIME" "$ACCOUNT" "$PROFILE"
+	echo "identity destroyed. The next start provisions a brand new server."
+}
+
+# ------------------------------------------------------------------ selftest
+
+# Runs offline. This is the CI gate: it proves the rendered config is accepted
+# by the pinned xray with WARP both on and off, that the x25519 parser survives
+# every historical output format, and that the share URI is complete.
+cmd_selftest() {
+	_tmp=$(mktemp -d)
+	trap 'rm -rf "$_tmp"' EXIT
+	TT_DATA=$_tmp
+	set_paths
+	_fail=0
+	# Never `cmd; _check $?` -- under `set -e` a failing test aborts the run
+	# instead of reporting it. Always evaluate inside the if.
+	_assert() { _d=$1; shift; if "$@"; then printf '  ok    %s\n' "$_d"; else printf '  FAIL  %s\n' "$_d"; _fail=1; fi; }
+	_jq() { jq -e "$1" "$CONF" >/dev/null 2>&1; }
+	# Subshell so that write_config's `die` cannot take the whole selftest with it.
+	_renders() { (WARP=$1; write_config) >/dev/null 2>&1; }
+
+	echo "transtation selftest"
+
+	# 1. x25519 parser against all three historical output formats.
+	_assert "x25519 parser: <=25.6.8 format" \
+		test "$(printf 'Private key: AAA\nPublic key: BBB\n' | parse_x25519)" = "AAA BBB"
+	_assert "x25519 parser: 25.9-26.1 format" \
+		test "$(printf 'PrivateKey: AAA\nPassword: BBB\n' | parse_x25519)" = "AAA BBB"
+	_assert "x25519 parser: >=26.3.27 format (Hash32 ignored)" \
+		test "$(printf 'PrivateKey: AAA\nPassword (PublicKey): BBB\nHash32: CCC\n' | parse_x25519)" = "AAA BBB"
+
+	# 2. real key generation reaches the 43-char assert.
+	provision_identity
+	# shellcheck source=/dev/null
+	. "$STATE"
+	_assert "generated x25519 keypair is 43 chars each" \
+		test "${#REALITY_PRIV}${#REALITY_PUB}" = "4343"
+
+	# 3. render + xray validation, WARP OFF.
+	user_add alice >/dev/null
+	user_add bob >/dev/null
+	HOST=203.0.113.10
+	PORT=443
+	SNI=www.microsoft.com
+	DEST=www.microsoft.com:443
+	_assert "config renders and xray accepts it (WARP off)" _renders 0
+	_assert "no warp-out outbound emitted when WARP is unregistered" \
+		_jq '.outbounds | map(.tag) | index("warp-out") == null'
+	_assert "final route falls back to direct when WARP is off" \
+		_jq '.routing.rules[-1].outboundTag == "direct"'
+
+	# 4. render + xray validation, WARP ON (synthetic profile).
+	printf '[Interface]\nPrivateKey = %s\nAddress = 172.16.0.2/32, 2606:4700:110:1:2:3:4:5/128\n' \
+		"$(head -c 32 /dev/urandom | base64)" >"$PROFILE"
+	_assert "config renders and xray accepts it (WARP on)" _renders 1
+	_assert "warp outbound pins noKernelTun (userspace gVisor stack)" \
+		_jq '.outbounds[0].settings.noKernelTun == true'
+	_assert "warp outbound does not random-pick between A and AAAA" \
+		_jq '.outbounds[0].settings.domainStrategy == "ForceIPv4v6"'
+	_assert "warp endpoint is a literal IP, not a hostname" \
+		_jq '.outbounds[0].settings.peers[0].endpoint | test("^[0-9.]+:[0-9]+$")'
+
+	# 5. invariants that protect users.
+	_assert "shortIds never contains the empty string" \
+		_jq '.inbounds[0].streamSettings.realitySettings.shortIds | index("") == null'
+	_assert "every shortId is even-length hex, at most 16 chars" \
+		_jq '.inbounds[0].streamSettings.realitySettings.shortIds | all(test("^([0-9a-f]{2}){1,8}$"))'
+	_assert "minClientVer pinned to 0.0.0 (no client silently rejected)" \
+		_jq '.inbounds[0].streamSettings.realitySettings.minClientVer == "0.0.0"'
+	_assert "outbound port 25 blocked (no open SMTP relay)" \
+		_jq '[.routing.rules[] | select(.port == "25")] | length == 1'
+	_assert "cloud metadata range 169.254.0.0/16 blocked" \
+		_jq '[.routing.rules[] | select(.outboundTag == "block") | .ip // []] | flatten | index("169.254.0.0/16")'
+	_assert "logs go to stdout, not an unrotated file" _jq '.log.error == ""'
+	_assert "health SOCKS inbound is loopback-only" _jq '.inbounds[1].listen == "127.0.0.1"'
+	_assert "two users produce two clients and two shortIds" \
+		_jq '(.inbounds[0].settings.clients | length) == 2 and (.inbounds[0].streamSettings.realitySettings.shortIds | length) == 2'
+
+	# 6. share URI completeness.
+	_u=$(head -1 "$USERS" | cut -f2)
+	_s=$(head -1 "$USERS" | cut -f3)
+	_uri=$(share_uri alice "$_u" "$_s")
+	_missing=""
+	for _k in encryption=none flow=xtls-rprx-vision security=reality sni= fp=chrome pbk= sid= spx= type=tcp headerType=none; do
+		case "$_uri" in *"$_k"*) ;; *) _missing="$_missing $_k" ;; esac
+	done
+	_assert "share URI carries all 10 parameters (${_missing:-none missing})" test -z "$_missing"
+	# `_assert desc ! cmd` cannot work -- `!` is a shell keyword and does not
+	# survive "$@" expansion -- so the negation lives inside the helper.
+	_uri_params_nonempty() { case "$_uri" in *"=&"* | *"=#"*) return 1 ;; *) return 0 ;; esac; }
+	_assert "share URI has no empty parameter values" _uri_params_nonempty
+
+	echo
+	[ "$_fail" = 0 ] || die "selftest FAILED"
+	echo "selftest passed"
+}
+
+# --------------------------------------------------------------------- run
+
+banner() {
+	printf '\n  transtation -- listening on 0.0.0.0:%s inside the container\n' "$INTERNAL_PORT"
+	printf '  server        %s:%s\n' "$HOST" "$PORT"
+	printf '  dest / SNI    %s\n' "$SNI"
+	if [ "${WARP:-1}" = 1 ] && ! warp_ready; then
+		printf '  egress        DIRECT -- WARP requested but NOT registered (see the warning above)\n'
+	elif warp_ready; then
+		printf '  egress        WARP (Cloudflare)\n'
+	else
+		printf '  egress        DIRECT (WARP=0)\n'
+	fi
+	printf '  users         %s\n' "$(awk -F'\t' 'NF>=3{printf "%s%s", (n++?", ":""), $1}' "$USERS")"
+	printf '  share link    transtation show      (never printed here -- it is a credential)\n\n'
+}
+
+cmd_run() {
+	[ -d "$DATA" ] || die "$DATA does not exist"
+	[ -w "$DATA" ] || die \
+		"$DATA is not writable by uid $(id -u).
+    If you replaced the named volume with a bind mount, either chown it:
+      chown -R 10001:10001 ./data
+    or switch back to the named volume, which inherits the right ownership."
+	umask 077
+
+	# --- identity: gated on its own artifact, written last and atomically ---
+	[ -s "$STATE" ] || provision_identity
+	# shellcheck source=/dev/null
+	. "$STATE"
+	[ "${SCHEMA:-0}" -le "$SCHEMA_SUPPORTED" ] || die \
+		"data schema $SCHEMA is newer than this image supports ($SCHEMA_SUPPORTED).
+    You pinned back to an older tag. Pull the newer one, or restore a backup."
+	migrate
+
+	# --- config: read from the environment every boot, never persisted ---
+	SNI=${SNI:-www.microsoft.com}
+	# Validated before anything else touches it: SNI reaches a JSON document and
+	# an unvalidated value sourced from a file would be a shell injection.
+	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
+		die "SNI must be a hostname, got: $SNI"
+	case "$SNI" in
+		*apple* | *icloud*) die "Xray warns that apple/icloud targets get your IP blocked by the GFW. Pick another SNI." ;;
+	esac
+	DEST=${DEST:-$SNI:443}
+	printf '%s' "$DEST" | grep -Eq '^[A-Za-z0-9.-]+:[0-9]{1,5}$' || die "DEST must be host:port, got: $DEST"
+	PORT=${PORT:-443}
+	printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] ||
+		die "PORT must be 1-65535, got: $PORT"
+
+	if [ -z "${HOST:-}" ]; then
+		HOST=$(curl -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p') || true
+	fi
+	[ -n "${HOST:-}" ] || die \
+		"could not auto-detect this host's public address.
+    Set HOST=<your.ip.or.domain> in your .env and start again."
+
+	if [ "${SKIP_DEST_CHECK:-0}" != 1 ]; then
+		xray tls ping "$SNI" >/dev/null 2>&1 ||
+			warn "TLS probe to $SNI failed from this host. Starting anyway, but clients may
+    fail the Reality handshake. Verify with: xray tls ping $SNI"
+	fi
+
+	# --- first user: gated on users.tsv, not on state.env ---------------
+	# This separation is the whole point. If provisioning is interrupted between
+	# writing the identity and creating the first user, the next start resumes
+	# instead of booting into a config with an empty shortIds array, which xray
+	# rejects outright and which turns into a crash loop you can only escape by
+	# destroying the volume.
+	[ -s "$USERS" ] || user_add "${USER_NAME:-main}"
+
+	# --- WARP: gated on the profile file, one attempt, never fatal ------
+	if warp_wanted && [ ! -f "$PROFILE" ]; then
+		warp_register || true
+	fi
+
+	write_config
+	write_runtime
+	banner
+	exec xray run -c "$CONF"
+}
+
+# --------------------------------------------------------------------- cli
+
+usage() {
+	cat <<-'EOF'
+		transtation -- VLESS + REALITY proxy server
+
+		  run                    start the server (default; this is what the image does)
+		  show [name]            print the share link and QR for a user, or for all users
+		  status                 server address, SNI, egress IP, users, WARP state
+		  health                 exit 0 if traffic (and WARP, if enabled) is getting out
+		  user add <name>        create a user with a fresh UUID and shortId, then apply
+		  user rm <name>         revoke a user, then apply
+		  user ls                list users
+		  warp register          register or re-register a Cloudflare WARP identity
+		  backup                 write a tar.gz of the identity to stdout
+		  reset                  destroy the identity (requires an explicit env var)
+		  selftest               offline self-check; no network, no state touched
+	EOF
+}
+
+case "${1:-run}" in
+	run) cmd_run ;;
+	show) shift; cmd_show "${1:-}" ;;
+	status) cmd_status ;;
+	health) cmd_health ;;
+	backup) cmd_backup ;;
+	reset) cmd_reset ;;
+	selftest) cmd_selftest ;;
+	user)
+		shift
+		case "${1:-}" in
+			add) shift; user_add "${1:-}"; apply ;;
+			rm) shift; user_rm "${1:-}"; apply ;;
+			ls | '') user_ls ;;
+			*) die "unknown: user $1" ;;
+		esac
+		;;
+	warp)
+		shift
+		case "${1:-}" in
+			register)
+				rm -f "$PROFILE"
+				warp_register && { echo "WARP registered."; apply; }
+				;;
+			*) die "unknown: warp ${1:-}" ;;
+		esac
+		;;
+	-h | --help | help) usage ;;
+	*) usage; die "unknown command: $1" ;;
+esac

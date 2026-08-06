@@ -1,0 +1,354 @@
+#!/bin/sh
+# transtation-client -- connect to a transtation server.
+#
+#   MODE=proxy (default)  local SOCKS5 + HTTP proxy. Unprivileged.
+#   MODE=tun              transparent whole-host tunnel. Linux, rootful.
+#
+# The share link is a credential. Mount it as a file rather than passing it in
+# the environment or on the command line: argv is world-readable through
+# /proc/<pid>/cmdline and lands in shell history, and environment variables are
+# visible in `docker inspect`.
+set -eu
+
+URI_FILE=${TT_URI_FILE:-/etc/transtation/uri}
+CONF=/run/transtation.json
+TUN_IFACE=tt0
+TUN_ADDR=172.19.0.1/30
+SOCKS_PORT=${SOCKS_PORT:-1080}
+
+die() { printf 'transtation-client: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'transtation-client: %s\n' "$*" >&2; }
+
+# --------------------------------------------------------------- share link
+
+parse_uri() {
+	_u=$1
+	case "$_u" in
+		vless://*) ;;
+		*) die "not a vless:// link. Get one from your server with: transtation show" ;;
+	esac
+	_rest=${_u#vless://}
+	_rest=${_rest%%#*}
+	QUERY=""
+	case "$_rest" in *\?*)
+		QUERY=${_rest#*\?}
+		_rest=${_rest%%\?*}
+		;;
+	esac
+	case "$_rest" in *@*) ;; *) die "link has no '@' -- it is truncated" ;; esac
+	UUID=${_rest%%@*}
+	_hp=${_rest#*@}
+	case "$_hp" in
+		\[*\]:*)
+			HOST=${_hp%%]*}
+			HOST=${HOST#[}
+			PORT=${_hp##*]:}
+			;;
+		*:*)
+			HOST=${_hp%%:*}
+			PORT=${_hp##*:}
+			;;
+		*) die "link has no port" ;;
+	esac
+
+	SNI=""; PBK=""; SID=""; FP=""; FLOW=""
+	_q=$QUERY
+	while [ -n "$_q" ]; do
+		_kv=${_q%%&*}
+		case "$_q" in *\&*) _q=${_q#*&} ;; *) _q="" ;; esac
+		_k=${_kv%%=*}
+		_v=${_kv#*=}
+		case "$_k" in
+			sni | serverName) SNI=$_v ;;
+			pbk | publicKey) PBK=$_v ;;
+			sid | shortId) SID=$_v ;;
+			fp | fingerprint) FP=$_v ;;
+			flow) FLOW=$_v ;;
+		esac
+	done
+}
+
+validate() {
+	# Trust boundary: every one of these values is interpolated into a JSON
+	# document below. Validate before, not after.
+	printf '%s' "$UUID" | grep -Eiq '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' ||
+		die "bad uuid in link"
+	[ "${#PBK}" -eq 43 ] ||
+		die "bad pbk: expected 43 characters, got ${#PBK}. Reissue the link with 'transtation show'."
+	printf '%s' "$PBK" | grep -Eq '^[A-Za-z0-9_-]{43}$' || die "pbk is not base64url"
+	printf '%s' "$SID" | grep -Eq '^([0-9a-fA-F]{2}){1,8}$' ||
+		die "bad sid: expected 2-16 hex characters, got '$SID'"
+	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || die "bad or missing sni"
+	[ -n "$HOST" ] || die "link has no server address"
+	printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] ||
+		die "bad port: $PORT"
+	# sing-box hard-errors with "uTLS is required by reality client" if the
+	# fingerprint is absent, where Xray-based clients would tolerate it.
+	FP=${FP:-chrome}
+	FLOW=${FLOW:-xtls-rprx-vision}
+
+	# Resolve once, here, so the container's resolver never has to look up the
+	# server name mid-flight -- and so the killswitch's bootstrap rule stays
+	# valid for as long as the tunnel does.
+	case "$HOST" in
+		*[!0-9.]*)
+			_ip=$(resolve4 "$HOST") || true
+			[ -n "$_ip" ] || die "cannot resolve $HOST from inside the container"
+			printf 'resolved %s -> %s\n' "$HOST" "$_ip"
+			SERVER_IP=$_ip
+			;;
+		*) SERVER_IP=$HOST ;;
+	esac
+}
+
+# getent comes from musl-utils and nslookup from busybox. Try both rather than
+# assuming which one a given base image happens to carry.
+resolve4() {
+	if command -v getent >/dev/null 2>&1; then
+		_r=$(getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1 {print $1}')
+		[ -n "$_r" ] && { printf '%s' "$_r"; return 0; }
+	fi
+	nslookup "$1" 2>/dev/null |
+		awk '/^Address:/ && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ { print $2; exit }'
+}
+
+# ------------------------------------------------------------------ configs
+
+json_suffix_array() {
+	# "a.com,b.com" -> "\"a.com\", \"b.com\"" ; empty input -> empty output
+	printf '%s' "${1:-}" | tr ',' '\n' |
+		sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+		awk 'NF { printf "%s\"%s\"", (n++ ? ", " : ""), $0 }'
+}
+
+vless_outbound() {
+	cat <<-EOF
+		    {
+		      "type": "vless",
+		      "tag": "proxy",
+		      "server": "$SERVER_IP",
+		      "server_port": $PORT,
+		      "uuid": "$UUID",
+		      "flow": "$FLOW",
+		      "packet_encoding": "xudp",
+		      "tls": {
+		        "enabled": true,
+		        "server_name": "$SNI",
+		        "utls": { "enabled": true, "fingerprint": "$FP" },
+		        "reality": { "enabled": true, "public_key": "$PBK", "short_id": "$SID" }
+		      }
+		    }
+	EOF
+}
+
+render_proxy() {
+	# No "dns" and no "route" block on purpose. Adding DNS configuration here
+	# makes leaks MORE likely, not fewer: what actually prevents them is the
+	# caller using socks5h:// so the proxy resolves, plus the server address
+	# already being a literal IP.
+	#
+	# listen is 0.0.0.0 *inside the container* -- binding 127.0.0.1 there would
+	# make the published port unreachable. Loopback confinement comes from the
+	# "127.0.0.1:" prefix on the docker -p flag, which the docs always use.
+	cat <<-EOF
+		{
+		  "log": { "level": "warn" },
+		  "inbounds": [
+		    {
+		      "type": "mixed",
+		      "tag": "in",
+		      "listen": "0.0.0.0",
+		      "listen_port": $SOCKS_PORT
+		    }
+		  ],
+		  "outbounds": [
+		$(vless_outbound)
+		  ]
+		}
+	EOF
+}
+
+render_tun() {
+	_direct=$(json_suffix_array "${DIRECT_SUFFIXES:-}")
+	if [ -n "$_direct" ]; then
+		_dns_rule="{ \"domain_suffix\": [$_direct], \"server\": \"local\" },"
+		_route_rule="{ \"domain_suffix\": [$_direct], \"outbound\": \"direct\" },"
+	else
+		_dns_rule=""
+		_route_rule=""
+	fi
+	cat <<-EOF
+		{
+		  "log": { "level": "warn" },
+		  "dns": {
+		    "servers": [
+		      { "tag": "doh", "type": "https", "server": "1.1.1.1", "detour": "proxy" },
+		      { "tag": "local", "type": "local" }
+		    ],
+		    "rules": [
+		      $_dns_rule
+		      { "domain_suffix": ["$SNI"], "server": "local" }
+		    ],
+		    "final": "doh",
+		    "strategy": "ipv4_only"
+		  },
+		  "inbounds": [
+		    {
+		      "type": "tun",
+		      "tag": "tun-in",
+		      "interface_name": "$TUN_IFACE",
+		      "address": ["$TUN_ADDR"],
+		      "mtu": 1500,
+		      "auto_route": true,
+		      "strict_route": true,
+		      "stack": "mixed"
+		    }
+		  ],
+		  "outbounds": [
+		$(vless_outbound),
+		    { "type": "direct", "tag": "direct", "routing_mark": 1 }
+		  ],
+		  "route": {
+		    "auto_detect_interface": true,
+		    "default_domain_resolver": "local",
+		    "rules": [
+		      { "action": "sniff" },
+		      { "protocol": "dns", "action": "hijack-dns" },
+		      { "ip_is_private": true, "outbound": "direct" },
+		      $_route_rule
+		      { "domain_suffix": [".local", ".lan", ".internal", ".home", ".arpa"], "outbound": "direct" }
+		    ],
+		    "final": "proxy"
+		  }
+		}
+	EOF
+}
+# routing_mark 1 on the direct outbound is not decoration: the killswitch
+# accepts `meta mark 0x1`, and without the mark every DIRECT_SUFFIXES
+# destination leaves unmarked on the physical NIC, is not on the tun interface,
+# and hits policy drop -- i.e. turning the killswitch on would kill the split
+# tunnel it exists to protect.
+
+# --------------------------------------------------------------- preflight
+
+preflight_tun() {
+	[ -e /dev/net/tun ] || die \
+		"no /dev/net/tun in this container. Add:  --device /dev/net/tun
+    If the HOST has no tun device either:
+      sudo modprobe tun && echo tun | sudo tee /etc/modules-load.d/tun.conf
+    Do NOT add --cap-add SYS_MODULE to let the container load it."
+
+	if ! ip rule add priority 32765 from all lookup main 2>/dev/null; then
+		die "cannot manage host routing. Either --cap-add NET_ADMIN is missing, or this
+    is rootless Docker/Podman -- where MODE=tun CANNOT work at all, because a
+    capability held in a child user namespace does not authorise operations on
+    a network namespace owned by the initial user namespace. Use MODE=proxy.
+    On Fedora/RHEL also try:  sudo setsebool -P container_use_devices=true"
+	fi
+	ip rule del priority 32765 2>/dev/null || true
+
+	[ -e /sys/class/net/docker0 ] || warn \
+		"docker0 is not visible from here, which usually means bridge networking.
+    MODE=tun needs --network host; without it the tunnel comes up inside the
+    container's own namespace and host traffic is untouched."
+}
+
+panic_banner() {
+	cat <<-EOF
+
+		  ┌─ IF YOUR NETWORK EVER DIES, RUN THIS ─────────────────────────────┐
+		  │   sudo nft delete table inet transtation 2>/dev/null              │
+		  │   for p in \$(seq 9000 9010); do sudo ip rule del priority \$p; done │
+		  │   sudo ip link del $TUN_IFACE                                              │
+		  └───────────────────────────────────────────────────────────────────┘
+		  (or:  sudo transtation-panic  --  or the 'panic' verb of this image)
+
+	EOF
+}
+
+# ------------------------------------------------------------------- panic
+
+cmd_panic() {
+	nft delete table inet transtation 2>/dev/null || true
+	nft delete table ip6 transtation 2>/dev/null || true
+	# sing-box's own ip rules live at priority 9000-9010 and are NOT bound to
+	# the interface, so they outlive a SIGKILLed container.
+	_p=9000
+	while [ "$_p" -le 9010 ]; do
+		ip -4 rule del priority "$_p" 2>/dev/null || true
+		ip -6 rule del priority "$_p" 2>/dev/null || true
+		_p=$((_p + 1))
+	done
+	ip route flush table 2022 2>/dev/null || true
+	ip -6 route flush table 2022 2>/dev/null || true
+	ip link del "$TUN_IFACE" 2>/dev/null || true
+	echo "killswitch removed, policy routing flushed. You are back on direct egress."
+}
+
+# --------------------------------------------------------------------- run
+
+cmd_run() {
+	if [ -n "${TT_URI:-}" ]; then
+		URI=$TT_URI
+		warn "reading the link from TT_URI. That is visible in 'docker inspect';
+    prefer mounting it:  -v /etc/transtation:/etc/transtation:ro"
+	elif [ -r "$URI_FILE" ]; then
+		URI=$(cat "$URI_FILE")
+	else
+		die "no share link. Mount one:
+      install -Dm600 /dev/stdin /etc/transtation/uri   # paste the vless:// link
+      docker run ... -v /etc/transtation:/etc/transtation:ro ..."
+	fi
+
+	parse_uri "$URI"
+	validate
+
+	case "${MODE:-proxy}" in
+		proxy)
+			render_proxy >"$CONF"
+			;;
+		tun)
+			preflight_tun
+			render_tun >"$CONF"
+			;;
+		*) die "MODE must be 'proxy' or 'tun', got: ${MODE:-}" ;;
+	esac
+
+	sing-box check -c "$CONF" || die "generated config rejected by $(sing-box version | head -1)"
+
+	printf '\n  transtation-client\n'
+	printf '  server   %s:%s  (sni %s)\n' "$SERVER_IP" "$PORT" "$SNI"
+	case "${MODE:-proxy}" in
+		proxy)
+			printf '  mode     proxy -- SOCKS5 + HTTP on :%s inside the container\n' "$SOCKS_PORT"
+			printf '  use it   export ALL_PROXY=socks5h://127.0.0.1:%s\n' "$SOCKS_PORT"
+			printf '           the "h" matters: plain socks5:// resolves DNS locally and leaks\n'
+			printf '           every hostname you visit.\n'
+			printf '  no killswitch is needed in this mode: nothing is redirected, so if this\n'
+			printf '  container dies, proxied connections simply fail.\n\n'
+			;;
+		tun)
+			printf '  mode     tun -- whole-host transparent tunnel on %s\n' "$TUN_IFACE"
+			printf '  direct   %s\n' "${DIRECT_SUFFIXES:-(none)}"
+			panic_banner
+			;;
+	esac
+
+	exec sing-box run -c "$CONF"
+}
+
+case "${1:-run}" in
+	run) cmd_run ;;
+	panic) cmd_panic ;;
+	check)
+		# Render both modes and validate them. Used by test.sh; needs no network
+		# beyond resolving the server name, so `check` accepts a literal IP link.
+		URI=${TT_URI:-$(cat "$URI_FILE")}
+		parse_uri "$URI"
+		validate
+		render_proxy >"$CONF" && sing-box check -c "$CONF" && echo "  ok    proxy-mode config accepted by sing-box"
+		DIRECT_SUFFIXES=${DIRECT_SUFFIXES:-example.com,example.net} render_tun >"$CONF" &&
+			sing-box check -c "$CONF" && echo "  ok    tun-mode config accepted by sing-box"
+		;;
+	*) die "unknown command: $1 (expected run, panic or check)" ;;
+esac

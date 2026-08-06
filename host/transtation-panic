@@ -1,0 +1,25 @@
+#!/bin/sh
+# transtation-panic -- get this machine back on direct egress, right now.
+#
+# Deliberately tiny and dependency-free: it must work when Docker is broken,
+# when there is no network at all, and when you are reading it off a phone at
+# 3am. It removes the killswitch, sweeps the ip rules sing-box leaves behind
+# when it is SIGKILLed (those are not bound to the interface, so they outlive
+# the tun device), and deletes the tun interface.
+set -u
+
+TUN_IFACE=${TUN_IFACE:-tt0}
+
+nft delete table inet transtation 2>/dev/null
+nft delete table ip6 transtation 2>/dev/null
+for p in $(seq 9000 9010); do
+	ip -4 rule del priority "$p" 2>/dev/null
+	ip -6 rule del priority "$p" 2>/dev/null
+done
+ip route flush table 2022 2>/dev/null
+ip -6 route flush table 2022 2>/dev/null
+ip link del "$TUN_IFACE" 2>/dev/null
+docker rm -f transtation-client 2>/dev/null >/dev/null
+
+echo "killswitch removed, policy routing flushed, $TUN_IFACE deleted."
+echo "you are back on direct egress."

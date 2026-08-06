@@ -1,0 +1,90 @@
+transtation
+Copyright (c) 2026 sqzer
+
+This project is licensed under the MIT License (see LICENSE).
+
+transtation itself contains no third-party source code. It is a set of shell
+scripts and Dockerfiles. The container images it builds, however, redistribute
+third-party binaries unmodified. Their licenses and obligations follow.
+
+================================================================================
+Xray-core  --  redistributed in ghcr.io/sqzer-x/transtation
+================================================================================
+
+Xray-core is licensed under the Mozilla Public License, Version 2.0 (MPL-2.0).
+
+  Upstream project : https://github.com/XTLS/Xray-core
+  Version shipped  : v26.3.27
+  Exact artifact   : https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip
+                     https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-arm64-v8a.zip
+  Source Form      : https://github.com/XTLS/Xray-core/tree/v26.3.27
+
+The `xray` binary in our image is the official upstream release artifact,
+byte-for-byte unmodified. We do not patch, recompile, or statically link it
+into anything. It is copied into the image as-is.
+
+The Source Code Form of Xray-core is governed by the MPL-2.0. A copy of that
+license is available at https://mozilla.org/MPL/2.0/ and is distributed with
+the upstream source at the URL above.
+
+The image ships no GeoIP or GeoSite data files. Those carry their own separate
+licenses (CC-BY-SA / GPL-3.0 depending on the dataset) and none of them apply
+here.
+
+================================================================================
+wgcf  --  redistributed in ghcr.io/sqzer-x/transtation
+================================================================================
+
+wgcf is licensed under the MIT License.
+
+  Upstream project : https://github.com/ViRb3/wgcf
+  Version shipped  : v2.2.32
+  Exact artifact   : https://github.com/ViRb3/wgcf/releases/download/v2.2.32/wgcf_2.2.32_linux_amd64
+                     https://github.com/ViRb3/wgcf/releases/download/v2.2.32/wgcf_2.2.32_linux_arm64
+
+The `wgcf` binary is the official upstream release artifact, unmodified. It is
+used only once, at first boot, to register a Cloudflare WARP identity. It is
+not part of the data path.
+
+Upstream's own disclaimer, reproduced verbatim:
+
+  "This project is in no way affiliated with, authorized, maintained, sponsored
+   or endorsed by Cloudflare or any of its affiliates or subsidiaries."
+
+The same applies to transtation. Cloudflare WARP is a Cloudflare service, used
+here through its documented client registration flow. Use of it is subject to
+Cloudflare's own terms.
+
+================================================================================
+sing-box  --  redistributed in ghcr.io/sqzer-x/transtation-client
+================================================================================
+
+sing-box is licensed under the GNU General Public License, Version 3 or later
+(GPL-3.0-or-later).
+
+  Upstream project : https://github.com/SagerNet/sing-box
+  Version shipped  : v1.13.16
+  Exact artifact   : https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-amd64.tar.gz
+                     https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-arm64.tar.gz
+  Source Form      : https://github.com/SagerNet/sing-box/tree/v1.13.16
+
+The `sing-box` binary in the client image is the official upstream release
+artifact, byte-for-byte unmodified. transtation does not link against it, embed
+it, or derive from it; it invokes it as a separate program with a generated
+configuration file. This is mere aggregation on a storage medium, and does not
+place transtation's own MIT-licensed scripts under the GPL.
+
+Complete corresponding source for the redistributed binary is available at the
+Source Form URL above.
+
+Per upstream's request, transtation is not affiliated with or endorsed by the
+sing-box project, and does not use its name to imply endorsement.
+
+================================================================================
+Alpine Linux base image
+================================================================================
+
+Both images are built FROM alpine:3.23 and install `ca-certificates`, `curl`,
+`jq`, `libqrencode-tools`, `nftables`, and `iproute2` from the Alpine package
+repositories. Those packages are distributed under their own licenses; run
+`apk info -L <package>` inside the image for per-package details.

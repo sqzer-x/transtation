@@ -1,0 +1,192 @@
+#!/bin/sh
+# transtation-killswitch -- fail-closed egress filter for MODE=tun.
+#
+# Host-owned on purpose. The client container never writes host firewall state:
+# with --network host its rules would land in the host's network namespace as
+# ordinary kernel state that outlives the container, and SIGKILL / OOM / a
+# dockerd crash bypasses any cleanup trap it might install. Worse, under
+# `restart: unless-stopped` a container that applies the killswitch and then
+# fails to start would sit in a loop re-closing your network faster than you
+# can open it.
+#
+#   transtation-killswitch on [--persist]
+#   transtation-killswitch off
+#   transtation-killswitch status
+set -eu
+
+URI_FILE=${TT_URI_FILE:-/etc/transtation/uri}
+TUN_IFACE=${TUN_IFACE:-tt0}
+UNIT=/etc/systemd/system/transtation-killswitch.service
+
+die() { printf 'transtation-killswitch: %s\n' "$*" >&2; exit 1; }
+
+[ "$(id -u)" = 0 ] || die "must run as root"
+command -v nft >/dev/null 2>&1 || die "nftables is not installed on this host"
+
+server_endpoint() {
+	[ -r "$URI_FILE" ] || die "cannot read $URI_FILE -- set TT_URI_FILE, or SERVER_IP and SERVER_PORT"
+	_u=$(cat "$URI_FILE")
+	_r=${_u#vless://}
+	_r=${_r%%#*}
+	_r=${_r%%\?*}
+	_hp=${_r#*@}
+	case "$_hp" in
+		\[*\]:*)
+			_h=${_hp%%]*}
+			_h=${_h#[}
+			_p=${_hp##*]:}
+			;;
+		*:*)
+			_h=${_hp%%:*}
+			_p=${_hp##*:}
+			;;
+		*) die "cannot parse a host:port out of $URI_FILE" ;;
+	esac
+	case "$_h" in
+		*[!0-9.]*)
+			_h=$(getent ahostsv4 "$_h" | awk 'NR==1 {print $1}')
+			[ -n "$_h" ] || die "cannot resolve the server address in $URI_FILE"
+			;;
+	esac
+	SERVER_IP=${SERVER_IP:-$_h}
+	SERVER_PORT=${SERVER_PORT:-$_p}
+}
+
+ks_on() {
+	server_endpoint
+
+	_admin=""
+	if [ -n "${ADMIN_CIDR:-}" ]; then
+		_admin="ip daddr $ADMIN_CIDR accept"
+	fi
+
+	_allow=""
+	if [ -n "${KILLSWITCH_ALLOW:-}" ]; then
+		# Raw nft expressions, ';'-separated. No mini-DSL: whoever runs this
+		# already holds NET_ADMIN over the host's network namespace, so there is
+		# no privilege boundary here to defend.
+		_allow=$(printf '%s' "$KILLSWITCH_ALLOW" | tr ';' '\n' | sed 's/^[[:space:]]*/    /')
+	fi
+
+	# Additive and scoped to our own table. NEVER `nft flush ruleset`: on a
+	# modern host that also wipes the iptables-nft tables Docker installs and
+	# silently breaks every container's networking. A DROP in any one table
+	# still drops, so scoping costs nothing in correctness.
+	nft delete table inet transtation 2>/dev/null || true
+	nft delete table ip6 transtation 2>/dev/null || true
+
+	nft -f - <<-EOF
+		table inet transtation {
+		  chain out {
+		    type filter hook output priority filter; policy drop;
+		    oif lo accept
+		    ct state established,related accept
+		    ct state invalid drop
+		    oifname "$TUN_IFACE" accept
+		    meta mark 0x1 accept
+		    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10, 224.0.0.0/4 } accept
+		    udp dport { 67, 68 } accept
+		    ip daddr $SERVER_IP tcp dport $SERVER_PORT accept
+		    ip daddr $SERVER_IP udp dport $SERVER_PORT accept
+		    $_admin
+		$_allow
+		    limit rate 5/minute log prefix "transtation-drop: "
+		  }
+		}
+		table ip6 transtation {
+		  chain out {
+		    type filter hook output priority filter; policy drop;
+		    oif lo accept
+		    ct state established,related accept
+		  }
+		}
+	EOF
+
+	cat <<-EOF
+		killswitch ON  (table inet transtation, output hook, policy drop)
+		  allowed out: loopback, established, $TUN_IFACE, fwmark 0x1 (split tunnel),
+		               RFC1918 + CGNAT + link-local + multicast, DHCP,
+		               $SERVER_IP:$SERVER_PORT${ADMIN_CIDR:+, admin $ADMIN_CIDR}
+		  IPv6 is dropped entirely except loopback and established.
+		  Your existing nftables rules were NOT modified; this is a separate table.
+
+		  LIMIT: this is an output-hook chain. It covers this host's own processes.
+		         Traffic FORWARDED from your other containers does not traverse the
+		         output hook and is NOT covered by it.
+
+		  off:   transtation-killswitch off
+		  panic: transtation-panic
+	EOF
+
+	if [ -n "${SSH_CONNECTION:-}" ]; then
+		cat <<-EOF
+
+			  NOTE: you are over SSH. Your session survives on the established rule, and
+			  new inbound SSH connections keep working too -- their reply packets are
+			  already ESTABLISHED. What stops is this host's own OUTBOUND traffic when
+			  the tunnel is down: DNS, package managers, monitoring agents. Set
+			  ADMIN_CIDR=<your.network/mask> if you want an explicit carve-out.
+		EOF
+	fi
+
+	if [ "${1:-}" = --persist ]; then
+		[ -d /run/systemd/system ] || {
+			cat <<-EOF
+
+				  --persist needs systemd, which is not running here. To make this survive a
+				  reboot on your own init, run this at boot:
+				      transtation-killswitch on
+			EOF
+			return 0
+		}
+		cat >"$UNIT" <<-EOF
+			[Unit]
+			Description=transtation killswitch
+			Before=network-pre.target
+			Wants=network-pre.target
+
+			[Service]
+			Type=oneshot
+			RemainAfterExit=yes
+			ExecStart=/usr/local/sbin/transtation-killswitch on
+			ExecStop=/usr/local/sbin/transtation-killswitch off
+
+			[Install]
+			WantedBy=multi-user.target
+		EOF
+		systemctl daemon-reload
+		systemctl enable transtation-killswitch.service >/dev/null
+		echo "  persisted: enabled transtation-killswitch.service"
+		echo "  (a broken fail-closed state now survives a reboot -- transtation-panic still clears it)"
+	fi
+}
+
+ks_off() {
+	nft delete table inet transtation 2>/dev/null || true
+	nft delete table ip6 transtation 2>/dev/null || true
+	if [ -f "$UNIT" ]; then
+		systemctl disable transtation-killswitch.service >/dev/null 2>&1 || true
+		rm -f "$UNIT"
+		systemctl daemon-reload 2>/dev/null || true
+	fi
+	echo "killswitch OFF (table inet transtation deleted; nothing else touched)"
+}
+
+ks_status() {
+	if nft list table inet transtation >/dev/null 2>&1; then
+		echo "killswitch is ON"
+		nft list table inet transtation
+	else
+		echo "killswitch is OFF (no table inet transtation)"
+	fi
+}
+
+case "${1:-}" in
+	on) shift; ks_on "${1:-}" ;;
+	off) ks_off ;;
+	status) ks_status ;;
+	*)
+		echo "usage: transtation-killswitch on [--persist] | off | status" >&2
+		exit 2
+		;;
+esac

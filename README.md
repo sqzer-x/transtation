@@ -1,0 +1,390 @@
+# transtation
+
+Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
+container on any Linux box that has Docker.
+
+```
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.0/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.0 release notes
+less install.sh           # please actually read it
+sudo sh install.sh
+```
+
+That is the whole server install. It generates its own Reality keypair, its own
+user, registers a WARP identity, and prints a `vless://` link and a QR code you
+scan with any client app.
+
+---
+
+## This is not a new idea, and you should know the alternatives
+
+[`reality-ezpz`](https://github.com/aleskxyz/reality-ezpz) already does Reality
++ WARP + share link + QR over Docker Compose. [`3x-ui`](https://github.com/MHSanaei/3x-ui)
+owns the web-panel end of this space with 44k stars and does far more than this
+does. If you want a panel, multiple users with quotas, subscription links or a
+Telegram bot, **use 3x-ui and stop reading here.**
+
+transtation exists because of a narrower set of preferences:
+
+- **A published, digest-pinned image**, not a 2,700-line bash generator you run
+  on your host.
+- **Zero capabilities.** The container holds no `NET_ADMIN`, mounts no
+  `/dev/net/tun`, and does not use host networking. WARP runs in Xray's
+  in-process userspace network stack.
+- **Tracking upstream.** Xray ships roughly monthly and its config schema moves.
+  If this project stops keeping up within a year it is worse than what it
+  replaced, and the right thing to do then is archive it and point at
+  reality-ezpz. That is a promise, not a disclaimer.
+
+---
+
+## Server
+
+### Install
+
+Two-step form above is the recommended one. If you are going to pipe it anyway:
+
+```
+curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.0/install.sh | sudo sh
+```
+
+The installer needs root, refuses anything other than x86_64/aarch64, installs
+Docker if it is missing, writes `/opt/transtation/{docker-compose.yml,.env}`,
+and waits for the container to report healthy. Running it again is an upgrade:
+it pulls and restarts, and never re-provisions.
+
+If you already run Docker and prefer to do it yourself:
+
+```yaml
+# /opt/transtation/docker-compose.yml
+services:
+  proxy:
+    image: ghcr.io/sqzer-x/transtation:v1.0.0
+    container_name: transtation
+    restart: unless-stopped
+    ports: ["443:8443"]
+    volumes: ["transtation-data:/data"]
+    env_file: .env
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+volumes:
+  transtation-data:
+```
+
+### Day to day
+
+```
+transtation show              # share link + QR for every user
+transtation status            # address, SNI, egress IP, WARP state, users
+transtation user add alice    # new UUID + shortId, applied immediately
+transtation user rm alice     # revokes both
+transtation backup            # tar.gz of everything irreplaceable, mode 0600
+transtation logs -f
+```
+
+`transtation user add` and `user rm` restart Xray to apply. Existing connections
+drop and clients reconnect on their own; Xray has no config reload signal.
+
+### Open the port
+
+The healthcheck only proves **outbound** traffic works. Nothing on the server
+can prove inbound does. If clients time out and the server log shows nothing at
+all, open TCP 443 in your provider's firewall or security group. Note that
+Docker's published ports **bypass `ufw`** in both directions, so a ufw rule is
+neither necessary nor sufficient; Oracle Cloud additionally needs the port
+opened in the instance's own iptables.
+
+---
+
+## Client
+
+You do not need this project's client at all. Any app that speaks VLESS +
+REALITY works with the link:
+
+| Platform | Use |
+|---|---|
+| Android | v2rayNG, Hiddify |
+| iOS | sing-box, Streisand, Shadowrocket |
+| Windows / macOS | v2rayN, Hiddify, sing-box |
+| Linux desktop, permanently | the native `sing-box` package plus upstream's systemd unit |
+
+The container is for headless Linux and for people who would rather not install
+anything.
+
+### Proxy mode (default) — a local SOCKS5 + HTTP proxy
+
+```
+sudo sh install.sh client
+```
+
+or by hand:
+
+```
+install -Dm600 /dev/stdin /etc/transtation/uri   # paste the vless:// link, then Ctrl-D
+docker run -d --name transtation-client --restart unless-stopped \
+  -p 127.0.0.1:1080:1080 \
+  -v /etc/transtation:/etc/transtation:ro \
+  ghcr.io/sqzer-x/transtation-client:v1.0.0
+```
+
+```
+export ALL_PROXY=socks5h://127.0.0.1:1080
+export HTTPS_PROXY=http://127.0.0.1:1080 HTTP_PROXY=http://127.0.0.1:1080
+```
+
+The **`h`** in `socks5h` is load-bearing: plain `socks5://` makes curl resolve
+DNS locally and leaks every hostname you visit. In Firefox, tick "Proxy DNS when
+using SOCKS v5".
+
+No capabilities, no devices, no host networking. Works under rootless Docker,
+rootless Podman and Docker Desktop.
+
+**Not covered:** QUIC (browsers do not send UDP over SOCKS, so it silently falls
+back to TCP), and any application that ignores proxy environment variables.
+**No killswitch is needed here** — nothing is redirected, so if the container
+dies, proxied connections simply fail. That is this mode's biggest advantage.
+
+### Tun mode — the whole host
+
+```
+sudo sh install.sh client --tun --killswitch
+```
+
+or by hand:
+
+```
+docker run -d --name transtation-client --restart unless-stopped \
+  --network host --cap-add NET_ADMIN --device /dev/net/tun \
+  -e MODE=tun \
+  -e DIRECT_SUFFIXES=example.com,example.net \
+  -v /etc/transtation:/etc/transtation:ro \
+  ghcr.io/sqzer-x/transtation-client:v1.0.0
+```
+
+Exactly three extra flags. `--privileged` is **not** needed and must not be
+used. `--network host` is not optional: without it the tunnel comes up inside
+the container's own network namespace and your host's traffic is untouched.
+
+**Linux only, rootful Docker only.** On Docker Desktop (Windows, macOS)
+`--network host` joins the *virtual machine's* namespace, so tun mode there is
+not unsupported, it is architecturally incapable. Under rootless Docker or
+Podman it cannot work either: a capability held in a child user namespace does
+not authorise operations on a network namespace owned by the initial one. The
+container detects both cases at startup and says so.
+
+Be honest with yourself about what this buys: a container with `--network host`
+and `CAP_NET_ADMIN` provides **no isolation whatsoever**, while adding the
+SELinux/AppArmor/rootless matrix and losing systemd-resolved integration (the
+container has no `resolvectl`, so sing-box falls back to hijacking port 53). For
+a permanent desktop setup the native `sing-box` package with upstream's hardened
+systemd unit is the better answer. Tun mode ships because it is genuinely useful
+on a headless box, not because it is more secure.
+
+`DIRECT_SUFFIXES` is a comma-separated list of domain suffixes that bypass the
+tunnel entirely — for sites that block proxy IPs, or a bank that objects to a
+foreign exit. Those domains also resolve locally rather than through the tunnel,
+so you get the geographically correct answer before connecting.
+
+### Killswitch and recovery
+
+`--killswitch` installs a host-owned nftables table with a `policy drop` output
+chain. It permits loopback, established connections, the tun interface, the
+split-tunnel fwmark, RFC1918/CGNAT/link-local/multicast, DHCP, and your server's
+address and port. Everything else is dropped, so nothing leaks when the tunnel
+is down.
+
+It is **additive** — a separate `table inet transtation` — and removing it is
+one command. Nothing in this project ever runs `nft flush ruleset`, which on a
+modern host would also wipe the iptables-nft tables Docker installs and silently
+break every container on the box.
+
+```
+sudo transtation-killswitch on [--persist]
+sudo transtation-killswitch off
+sudo transtation-killswitch status
+```
+
+Persistence is opt-in. By default the killswitch dies at reboot, because reboot
+is the first thing everyone tries when the network stops working.
+
+**Two limits, stated plainly.** It is an output-hook chain: it covers this host's
+own processes, and traffic *forwarded* from your other containers does not
+traverse it. And if you test it by SIGKILLing the client, note that sing-box's
+own ip rules at priority 9000–9010 survive — they are not bound to the
+interface.
+
+If your network ever dies:
+
+```
+sudo transtation-panic
+```
+
+Six lines, no network and no Docker needed. It also exists as a verb of the
+client image (`docker run --rm --network host --cap-add NET_ADMIN <image> panic`),
+and the three raw commands are printed in the client's startup banner every
+boot, so they are in `docker logs` and in your scrollback.
+
+---
+
+## Configuration
+
+Nothing is required. Copy `.env.example` to `/opt/transtation/.env` and set only
+what you want to change; every value is read fresh on each boot.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `PORT` | `443` | public port |
+| `HOST` | auto-detected | address that goes into the share link |
+| `SNI` | `www.microsoft.com` | the site your server impersonates |
+| `DEST` | `$SNI:443` | where the handshake is forwarded |
+| `WARP` | `1` | `0` to egress from the VPS IP instead |
+| `WARP_ENDPOINT` | `162.159.192.1:2408` | override if this anycast address does not handshake |
+| `USER_NAME` | `main` | name of the user created on first boot |
+| `MIN_CLIENT_VER` | `0.0.0` | Reality client version floor |
+| `SKIP_DEST_CHECK` | `0` | skip the startup TLS probe of `$SNI` |
+
+**Choosing an SNI matters more than anything else here.** Pick a high-reputation
+site that speaks TLS 1.3 + X25519 + HTTP/2, is plausibly popular where your
+server lives, and ideally sits in the same cloud or ASN. A Tokyo VPS borrowing a
+Japanese site's handshake looks ordinary; borrowing a Brazilian bank's does not.
+Check a candidate before committing:
+
+```
+docker compose exec proxy xray tls ping example.com
+```
+
+Apple and iCloud domains are rejected outright — Xray itself warns that they get
+your IP blocked by the GFW.
+
+---
+
+## Capabilities: do not add any
+
+This is the single easiest way to break a working install, so it gets its own
+section.
+
+| | Needed? | |
+|---|---|---|
+| `cap_add: NET_ADMIN` | **no — actively harmful** | Xray probes for `CAP_NET_ADMIN` up front and takes kernel TUN when it finds it. `createKernelTun` writes to `/proc/sys/.../rp_filter` *before* opening the device, Docker mounts `/proc/sys` read-only, and there is no fallback to userspace. WARP dies. |
+| `--device /dev/net/tun` | no | the gVisor network stack runs in-process |
+| `CAP_NET_BIND_SERVICE` | no | it listens on 8443 inside; `-p 443:8443` does the privileged bind in dockerd |
+| `--network host` | no, and must not be used | it would expose the loopback SOCKS inbound the healthcheck uses, turning your server into an open relay |
+
+To confirm the good path is live:
+
+```
+docker compose logs proxy | grep -o 'Using .* TUN'    # -> Using gVisor TUN
+```
+
+---
+
+## What this does not protect you from
+
+- **Your account.** The VPS is rented in your name with your card. Reality hides
+  *what* the traffic is, not *whose* server it is.
+- **Traffic analysis over time.** Reality is very good against a prober that
+  connects and looks; it is not a defence against an adversary correlating flow
+  timing and volume across a link they fully observe.
+- **The endpoint.** Sites still see a browser fingerprint, cookies, and a login.
+- **Publishing your link.** A `vless://` link is a credential *and* a permanent
+  fingerprint of your server. Once it is public, revoke it (`transtation user rm`)
+  — the shortId goes with it.
+- **BitTorrent.** The default routing blocks *unencrypted* BitTorrent
+  handshakes. Encrypted BT (MSE/PE, the modern default) and DHT pass straight
+  through. You have no DMCA protection here; your provider will forward the
+  notice to you.
+- **Outbound abuse from your own box.** Port 25 is blocked by default so a
+  WARP-less install is not an open SMTP relay, and the cloud metadata range
+  `169.254.0.0/16` is blocked so a client of your proxy cannot read your
+  instance's IAM credentials. Everything else your users do leaves from your IP.
+
+## About WARP
+
+With `WARP=1` (the default) traffic exits from a Cloudflare address instead of
+your VPS's. Your server's IP never reaches the destination, and cloud-IP
+blocklists do not apply to you.
+
+The costs are real: a shared exit pool means more CAPTCHAs, the exit's geography
+is Cloudflare's choice and not your VPS's, the free tier is throttled under
+sustained load, and MTU drops to 1280. Registration also depends on an
+undocumented third-party API. If any of that bothers you, set `WARP=0` — the
+proxy works exactly the same, it just egresses from your own address.
+
+If registration fails, the server **starts anyway** with direct egress and says
+so on every boot and in `transtation status`. It never retries in a loop:
+hammering Cloudflare's registration endpoint is how a source IP, historically a
+whole region, gets blocked.
+
+---
+
+## Backup, upgrade, uninstall
+
+```
+transtation backup                        # -> /root/transtation-backup.tgz, mode 0600
+```
+
+That tarball holds your Reality private key, your users, and your WARP account.
+It is the only thing on the box you cannot regenerate. Restoring is one command
+into a fresh volume:
+
+```
+docker run --rm -v transtation-data:/data -v /root:/b alpine \
+  tar xzf /b/transtation-backup.tgz -C /data
+```
+
+Upgrades: re-run `install.sh`, or `docker compose pull && docker compose up -d`.
+Your identity lives in the volume and survives; the config is regenerated from
+the new image every boot, so schema changes come along for free.
+
+```
+sudo sh install.sh --uninstall
+```
+
+It removes the containers and the compose file, and asks separately before
+deleting the data volume.
+
+---
+
+## About `curl | sh`
+
+It is a real objection and this project does not wave it away:
+
+1. **You cannot review what you pipe.** So the documented form downloads the
+   script, checks its hash against the release notes, and lets you read it. Do
+   that.
+2. **A truncated download could execute half a script.** Everything here lives
+   in functions and `main "$@"` is the last line, so a truncated file runs
+   nothing.
+3. **It installs Docker via `get.docker.com`**, a ~780-line third-party script,
+   as root. The installer tells you before it does, and skips the step entirely
+   if Docker is already present.
+4. **The image tag is mutable.** Release builds pin the image by SHA-256 digest
+   in the compose file, so a retagged image will not be pulled.
+
+The Xray binary is verified inside the Dockerfile against the `.dgst` file from
+the same GitHub release. That defends against a bad mirror or a truncated
+transfer, **not** against a compromised upstream — Xray publishes no signatures.
+sing-box publishes no checksum file at all, so its hashes are pinned in
+`client/Dockerfile` and reviewed as part of this repo.
+
+## Building and testing yourself
+
+```
+git clone https://github.com/sqzer-x/transtation && cd transtation
+sh test.sh
+```
+
+Builds both images and runs their offline self-checks: the config renders and is
+accepted by the pinned Xray with WARP on *and* off, the `xray x25519` parser
+survives all three historical output formats, every invariant that protects you
+(no empty shortId, port 25 blocked, metadata range blocked, loopback-only health
+inbound) holds, both client configs are accepted by sing-box, and malformed
+share links are rejected. Everything runs with `--network none`; the test suite
+never registers a WARP identity.
+
+## License
+
+MIT. See [LICENSE](LICENSE). Third-party binaries redistributed in the images —
+Xray-core (MPL-2.0), wgcf (MIT), sing-box (GPL-3.0-or-later) — and their
+obligations are listed in [NOTICE](NOTICE).

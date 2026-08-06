@@ -1,0 +1,6 @@
+# Never commit this. It is not secret by itself, but a fork that commits it
+# leaks your server address, SNI and port, and people copy .env into infra repos.
+.env
+
+# Backups produced by `transtation backup` — these DO contain private keys.
+*.tgz

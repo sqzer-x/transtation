@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      # Builds both images for amd64 only and runs their offline self-checks.
+      # Everything runs with --network none, so CI never registers a WARP
+      # identity: hammering Cloudflare's registration endpoint from shared
+      # runner IPs is how an entire address range gets rate-limited.
+      - name: test
+        run: sh test.sh
+
+  publish:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - name: transtation
+            dockerfile: server/Dockerfile
+          - name: transtation-client
+            dockerfile: client/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern=v{{version}}
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=long
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Provenance and SBOM attestations are off: they add a manifest list
+          # entry that some older clients choke on, and the compose file is
+          # already pinned by digest, which closes the mutable-tag hole for
+          # free. Turn them on when a downstream consumer asks for them.
+          provenance: false
+          sbom: false
+
+      # The digest goes into install.sh at release time so that the compose file
+      # pins the image by content, not by a mutable tag.
+      - name: digest
+        run: echo "${{ matrix.name }} -> ${{ steps.build.outputs.digest }}" >> "$GITHUB_STEP_SUMMARY"

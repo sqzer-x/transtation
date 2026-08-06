@@ -1,0 +1,356 @@
+#!/bin/sh
+# transtation installer.
+#
+#   sh install.sh                          install the server
+#   sh install.sh client                   install the client, proxy mode
+#   sh install.sh client --tun             install the client, whole-host tunnel
+#   sh install.sh client --tun --killswitch   ... and a fail-closed egress filter
+#   sh install.sh --uninstall              remove whichever is installed here
+#
+# `set -eu`, deliberately NOT `-o pipefail`: /bin/sh is dash on Debian and
+# Ubuntu -- the primary target -- and `curl | sh` ignores the shebang, so
+# pipefail would abort this script on its first line.
+#
+# Everything of substance lives in functions, and main() is invoked on the very
+# last line. If the download is truncated, nothing runs.
+set -eu
+
+VERSION=${TT_VERSION:-v1.0.0}
+IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
+IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
+# Filled in by the release workflow. A tag is mutable -- the same stolen-token
+# compromise we already concede for Xray's .dgst would let someone retag
+# v1.0.0, and the hash-verified installer you read would vouch for nothing.
+SERVER_DIGEST=${TT_SERVER_DIGEST:-}
+CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
+
+DIR=/opt/transtation
+URI_DIR=/etc/transtation
+RAW=https://raw.githubusercontent.com/sqzer-x/transtation/$VERSION
+
+say() { printf '%s\n' "$*"; }
+step() { printf '  %-14s%s\n' "$1" "$2"; }
+die() { printf '\ntranstation: %s\n\n' "$*" >&2; exit 1; }
+
+server_image() { printf '%s:%s%s' "$IMAGE_SERVER" "$VERSION" "${SERVER_DIGEST:+@$SERVER_DIGEST}"; }
+client_image() { printf '%s:%s%s' "$IMAGE_CLIENT" "$VERSION" "${CLIENT_DIGEST:+@$CLIENT_DIGEST}"; }
+
+need_root() {
+	[ "$(id -u)" = 0 ] || die "this needs root. Re-run as root, or with sudo:
+    curl -fsSLO $RAW/install.sh && sudo sh install.sh $*"
+}
+
+check_arch() {
+	case "$(uname -m)" in
+		x86_64 | amd64 | aarch64 | arm64) ;;
+		*) die "unsupported architecture: $(uname -m). transtation ships amd64 and arm64 images only." ;;
+	esac
+}
+
+os_id() {
+	# shellcheck disable=SC1091
+	[ -r /etc/os-release ] && . /etc/os-release && printf '%s' "${ID:-unknown}" || printf 'unknown'
+}
+
+install_docker() {
+	if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+		step docker "$(docker --version | cut -d, -f1), compose $(docker compose version --short)"
+		return 0
+	fi
+	say ""
+	step docker "not found -- installing"
+	case "$(os_id)" in
+		alpine)
+			# get.docker.com hard-fails on Alpine.
+			apk add --no-cache docker docker-cli-compose >/dev/null
+			rc-update add docker default >/dev/null 2>&1 || true
+			service docker start >/dev/null 2>&1 || true
+			;;
+		arch | archarm | manjaro | endeavouros)
+			# get.docker.com hard-fails on Arch too.
+			pacman -S --needed --noconfirm docker docker-compose >/dev/null
+			systemctl enable --now docker >/dev/null 2>&1 || true
+			;;
+		*)
+			say "                 NOTE: this runs https://get.docker.com, a ~780-line third-party"
+			say "                 script, as root. We do not review it. If you would rather not,"
+			say "                 install Docker yourself and run this installer again."
+			curl -fsSL https://get.docker.com | sh >/dev/null
+			systemctl enable --now docker >/dev/null 2>&1 || true
+			;;
+	esac
+	command -v docker >/dev/null 2>&1 || die "Docker installation failed. Install it yourself and re-run."
+	docker compose version >/dev/null 2>&1 || die "the Docker Compose plugin is missing. Install docker-compose-plugin and re-run."
+	step docker "$(docker --version | cut -d, -f1), compose $(docker compose version --short)"
+	say "                 note: installing Docker sets net.ipv4.ip_forward=1 on this host."
+}
+
+wait_healthy() {
+	_name=$1 _limit=${2:-120} _t=0
+	while [ "$_t" -lt "$_limit" ]; do
+		case "$(docker inspect -f '{{.State.Health.Status}}' "$_name" 2>/dev/null || echo none)" in
+			healthy) printf 'healthy (%ss)\n' "$_t"; return 0 ;;
+			unhealthy | none) ;;
+		esac
+		sleep 3
+		_t=$((_t + 3))
+		printf '.'
+	done
+	printf 'TIMED OUT (%ss)\n' "$_limit"
+	return 1
+}
+
+# ------------------------------------------------------------------ server
+
+install_server() {
+	need_root
+	check_arch
+	say ""
+	say "  transtation $VERSION -- your own VLESS + REALITY proxy"
+	say "  https://github.com/sqzer-x/transtation"
+	say ""
+	step host "$(os_id) / $(uname -m) / root"
+	install_docker
+
+	mkdir -p "$DIR"
+	if [ -f "$DIR/docker-compose.yml" ]; then
+		step config "already present at $DIR -- reusing it (this is an upgrade, not a reinstall)"
+	else
+		cat >"$DIR/docker-compose.yml" <<-EOF
+			services:
+			  proxy:
+			    image: $(server_image)
+			    container_name: transtation
+			    restart: unless-stopped
+			    ports: ["\${PORT:-443}:8443"]
+			    volumes: ["transtation-data:/data"]
+			    env_file: .env
+			    logging:
+			      driver: json-file
+			      options: { max-size: "10m", max-file: "3" }
+			    # Do NOT add cap_add: NET_ADMIN or devices: /dev/net/tun here.
+			    # Both BREAK the WARP outbound. See README, "Capabilities".
+			volumes:
+			  transtation-data:
+		EOF
+		: >"$DIR/.env"
+		chmod 600 "$DIR/.env"
+		step config "wrote $DIR/docker-compose.yml and $DIR/.env"
+	fi
+	[ -n "$SERVER_DIGEST" ] || say "                 note: image pinned by tag, not digest (unreleased build)"
+
+	install_wrapper
+	step wrapper "installed /usr/local/bin/transtation"
+
+	printf '  %-14s' image
+	docker compose -f "$DIR/docker-compose.yml" --project-directory "$DIR" pull -q 2>/dev/null || true
+	say "pulled $(server_image)"
+
+	printf '  %-14s' start
+	docker compose -f "$DIR/docker-compose.yml" --project-directory "$DIR" up -d >/dev/null
+	if ! wait_healthy transtation 120; then
+		say ""
+		say "  The container is up but not healthy yet. Most common causes:"
+		say "    - the WARP tunnel is not passing traffic (some providers block outbound"
+		say "      UDP/2408 even though registration, which is TCP, succeeded). Fix:"
+		say "        sed -i 's/^WARP=1/WARP=0/' $DIR/.env || echo WARP=0 >> $DIR/.env"
+		say "        cd $DIR && docker compose up -d"
+		say "    - no outbound HTTPS from this host at all."
+		say ""
+		say "  Diagnose with:  transtation status   and   transtation logs"
+		exit 1
+	fi
+
+	say ""
+	transtation status || true
+	_port=$(sed -n 's/^PORT=//p' "$DIR/.env" 2>/dev/null | tail -1)
+	cat <<-EOF
+		  DO THIS NOW -- it is the only irreplaceable thing on this box:
+		      transtation backup
+
+		  Your link:   transtation show
+		  Add a user:  transtation user add alice
+		  Uninstall:   sh install.sh --uninstall
+
+		  >> If a client cannot connect, open TCP ${_port:-443} in your provider's
+		     firewall or security group. The healthcheck above only proves OUTBOUND
+		     traffic works; inbound cannot be verified from this host. Note that
+		     Docker's published ports bypass ufw in both directions.
+
+	EOF
+}
+
+install_wrapper() {
+	cat >/usr/local/bin/transtation <<-EOF
+		#!/bin/sh
+		set -eu
+		C="docker compose -f $DIR/docker-compose.yml --project-directory $DIR"
+		case "\${1:-}" in
+		  backup)
+		    f=\${2:-/root/transtation-backup.tgz}
+		    [ -e "\$f" ] && { echo "\$f exists -- refusing to overwrite" >&2; exit 1; }
+		    # root's umask is 022 on every target distro, which would make a
+		    # world-readable tarball of your Reality private key, your WARP private
+		    # key and your WARP bearer token.
+		    umask 077
+		    \$C exec -T proxy transtation backup > "\$f"
+		    echo "backed up to \$f (mode 0600): reality key, users, WARP account."
+		    ;;
+		  logs) shift; exec \$C logs "\$@" ;;
+		  up|down|pull|restart) exec \$C "\$@" ;;
+		  *) exec \$C exec proxy transtation "\$@" ;;
+		esac
+	EOF
+	chmod 0755 /usr/local/bin/transtation
+}
+
+# ------------------------------------------------------------------ client
+
+install_client() {
+	need_root
+	check_arch
+	_tun=0 _ks=0 _uri=""
+	for a in "$@"; do
+		case "$a" in
+			--tun) _tun=1 ;;
+			--killswitch) _ks=1 ;;
+			vless://*) _uri=$a ;;
+			*) die "unknown option: $a" ;;
+		esac
+	done
+	[ "$_ks" = 0 ] || [ "$_tun" = 1 ] || die "--killswitch only makes sense together with --tun"
+
+	say ""
+	say "  transtation client $VERSION"
+	say ""
+
+	if [ -z "$_uri" ] && [ ! -r "$URI_DIR/uri" ]; then
+		say "  paste the link from your server (run 'transtation show' there):"
+		printf '  > '
+		read -r _uri
+	fi
+	if [ -n "$_uri" ]; then
+		mkdir -p "$URI_DIR"
+		umask 077
+		printf '%s\n' "$_uri" >"$URI_DIR/uri"
+		chmod 600 "$URI_DIR/uri"
+		step link "stored at $URI_DIR/uri (0600)"
+	else
+		step link "reusing $URI_DIR/uri"
+	fi
+
+	install_docker
+	docker rm -f transtation-client >/dev/null 2>&1 || true
+
+	if [ "$_tun" = 1 ]; then
+		step mode "tun -- whole-host transparent tunnel"
+		docker run -d --name transtation-client --restart unless-stopped \
+			--network host --cap-add NET_ADMIN --device /dev/net/tun \
+			-e MODE=tun \
+			${DIRECT_SUFFIXES:+-e DIRECT_SUFFIXES="$DIRECT_SUFFIXES"} \
+			-v "$URI_DIR":"$URI_DIR":ro \
+			"$(client_image)" >/dev/null
+		install -Dm0755 /dev/stdin /usr/local/sbin/transtation-panic <<-'EOF'
+			#!/bin/sh
+			set -u
+			TUN_IFACE=${TUN_IFACE:-tt0}
+			nft delete table inet transtation 2>/dev/null
+			nft delete table ip6 transtation 2>/dev/null
+			for p in $(seq 9000 9010); do
+			  ip -4 rule del priority "$p" 2>/dev/null
+			  ip -6 rule del priority "$p" 2>/dev/null
+			done
+			ip route flush table 2022 2>/dev/null
+			ip -6 route flush table 2022 2>/dev/null
+			ip link del "$TUN_IFACE" 2>/dev/null
+			docker rm -f transtation-client 2>/dev/null >/dev/null
+			echo "killswitch removed, policy routing flushed. You are back on direct egress."
+		EOF
+		step panic "installed /usr/local/sbin/transtation-panic"
+		if [ "$_ks" = 1 ]; then
+			curl -fsSL "$RAW/host/transtation-killswitch" -o /usr/local/sbin/transtation-killswitch 2>/dev/null ||
+				die "could not fetch the killswitch script from $RAW"
+			chmod 0755 /usr/local/sbin/transtation-killswitch
+			/usr/local/sbin/transtation-killswitch on
+		fi
+	else
+		step mode "proxy -- local SOCKS5 + HTTP, no root privileges used at runtime"
+		docker run -d --name transtation-client --restart unless-stopped \
+			-p 127.0.0.1:1080:1080 \
+			-v "$URI_DIR":"$URI_DIR":ro \
+			"$(client_image)" >/dev/null
+	fi
+
+	sleep 4
+	printf '  %-14s' self-test
+	if [ "$_tun" = 1 ]; then
+		curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
+			grep -E '^(ip|warp|colo)=' | tr '\n' ' ' || printf 'no answer yet'
+	else
+		curl -fsS --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
+			grep -E '^(ip|warp|colo)=' | tr '\n' ' ' || printf 'no answer yet -- check: docker logs transtation-client'
+	fi
+	say ""
+
+	if [ "$_tun" = 0 ]; then
+		cat <<-'EOF'
+
+			  export ALL_PROXY=socks5h://127.0.0.1:1080 HTTPS_PROXY=http://127.0.0.1:1080 HTTP_PROXY=http://127.0.0.1:1080
+
+			    The "h" in socks5h is load-bearing: plain socks5:// makes curl resolve DNS
+			    locally and leaks every hostname you visit. In Firefox, tick "Proxy DNS
+			    when using SOCKS v5".
+			    Not covered by this mode: QUIC (it degrades to TCP) and any app that
+			    ignores proxy environment variables.
+
+			  Whole-system tunnel instead:  sudo sh install.sh client --tun --killswitch
+
+		EOF
+	else
+		say ""
+		say "  If your network ever dies:  sudo transtation-panic"
+		say ""
+	fi
+}
+
+# --------------------------------------------------------------- uninstall
+
+uninstall() {
+	need_root
+	if [ -d "$DIR" ]; then
+		docker compose -f "$DIR/docker-compose.yml" --project-directory "$DIR" down >/dev/null 2>&1 || true
+		rm -f "$DIR/docker-compose.yml" "$DIR/.env" /usr/local/bin/transtation
+		rmdir "$DIR" 2>/dev/null || true
+		say "server removed."
+		printf 'also delete the data volume? That destroys your Reality key and every issued link. [y/N] '
+		read -r a
+		case "$a" in
+			y | Y) docker volume rm transtation-data >/dev/null 2>&1 && say "volume deleted." ;;
+			*) say "volume kept: 'docker volume ls | grep transtation-data'" ;;
+		esac
+	fi
+	if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx transtation-client; then
+		docker rm -f transtation-client >/dev/null
+		say "client removed."
+	fi
+	if [ -x /usr/local/sbin/transtation-killswitch ]; then
+		/usr/local/sbin/transtation-killswitch off || true
+		rm -f /usr/local/sbin/transtation-killswitch
+	fi
+	rm -f /usr/local/sbin/transtation-panic
+	say "done. $URI_DIR was left in place; remove it yourself if you are finished with it."
+}
+
+main() {
+	case "${1:-server}" in
+		server) shift 2>/dev/null || true; install_server ;;
+		client) shift; install_client "$@" ;;
+		--uninstall | uninstall) uninstall ;;
+		-h | --help)
+			sed -n '2,10p' "$0" 2>/dev/null || say "see https://github.com/sqzer-x/transtation"
+			;;
+		*) die "unknown command: $1 (expected: server, client, --uninstall)" ;;
+	esac
+}
+
+main "$@"

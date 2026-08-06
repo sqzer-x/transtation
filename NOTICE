@@ -4,8 +4,9 @@ Copyright (c) 2026 sqzer
 This project is licensed under the MIT License (see LICENSE).
 
 transtation itself contains no third-party source code. It is a set of shell
-scripts and Dockerfiles. The container images it builds, however, redistribute
-third-party binaries unmodified. Their licenses and obligations follow.
+scripts and one Dockerfile. The server image redistributes third-party binaries
+unmodified; the client installer downloads one rather than shipping it. Their
+licenses and obligations follow.
 
 ================================================================================
 Xray-core  --  redistributed in ghcr.io/sqzer-x/transtation
@@ -56,26 +57,23 @@ here through its documented client registration flow. Use of it is subject to
 Cloudflare's own terms.
 
 ================================================================================
-sing-box  --  redistributed in ghcr.io/sqzer-x/transtation-client
+sing-box  --  NOT redistributed; downloaded from upstream by the installer
 ================================================================================
 
 sing-box is licensed under the GNU General Public License, Version 3 or later
 (GPL-3.0-or-later).
 
   Upstream project : https://github.com/SagerNet/sing-box
-  Version shipped  : v1.13.16
-  Exact artifact   : https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-amd64.tar.gz
-                     https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-arm64.tar.gz
+  Version pinned   : v1.13.16
+  Fetched from     : https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-amd64-musl.tar.gz
+                     https://github.com/SagerNet/sing-box/releases/download/v1.13.16/sing-box-1.13.16-linux-arm64-musl.tar.gz
   Source Form      : https://github.com/SagerNet/sing-box/tree/v1.13.16
 
-The `sing-box` binary in the client image is the official upstream release
-artifact, byte-for-byte unmodified. transtation does not link against it, embed
-it, or derive from it; it invokes it as a separate program with a generated
-configuration file. This is mere aggregation on a storage medium, and does not
-place transtation's own MIT-licensed scripts under the GPL.
-
-Complete corresponding source for the redistributed binary is available at the
-Source Form URL above.
+transtation does not ship sing-box. `install.sh client` downloads the official
+release artifact from the URL above, verifies it against a SHA-256 recorded in
+this repository, and installs it. Nothing here links against it, embeds it or
+derives from it; the client script invokes it as a separate program with a
+generated configuration file.
 
 Per upstream's request, transtation is not affiliated with or endorsed by the
 sing-box project, and does not use its name to imply endorsement.
@@ -84,7 +82,6 @@ sing-box project, and does not use its name to imply endorsement.
 Alpine Linux base image
 ================================================================================
 
-Both images are built FROM alpine:3.23 and install `ca-certificates`, `curl`,
-`jq`, `libqrencode-tools`, `nftables`, and `iproute2` from the Alpine package
-repositories. Those packages are distributed under their own licenses; run
+The server image is built FROM alpine:3.23 and installs `ca-certificates`,
+`curl`, `jq` and `libqrencode-tools` from the Alpine package repositories. Those packages are distributed under their own licenses; run
 `apk info -L <package>` inside the image for per-package details.

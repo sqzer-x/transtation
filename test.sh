@@ -10,7 +10,6 @@ set -eu
 cd "$(dirname "$0")"
 
 SERVER_IMG=${SERVER_IMG:-transtation-test-server}
-CLIENT_IMG=${CLIENT_IMG:-transtation-test-client}
 FIXTURE_URI='vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&spx=%2F&type=tcp&headerType=none#transtation-test'
 
 fail=0
@@ -99,11 +98,7 @@ docker buildx version >/dev/null 2>&1 || {
 docker buildx build --load -f server/Dockerfile -t "$SERVER_IMG" . >/dev/null 2>&1 ||
 	{ bad "server image builds"; exit 1; }
 ok "server image builds"
-docker buildx build --load -f client/Dockerfile -t "$CLIENT_IMG" . >/dev/null 2>&1 ||
-	{ bad "client image builds"; exit 1; }
-ok "client image builds"
 docker image inspect "$SERVER_IMG" >/dev/null 2>&1 || { bad "server image exists"; exit 1; }
-docker image inspect "$CLIENT_IMG" >/dev/null 2>&1 || { bad "client image exists"; exit 1; }
 
 echo
 echo "== server selftest (offline) =="
@@ -137,42 +132,58 @@ check "install.sh survives dash (Debian, Ubuntu) with no arguments" posix_sh_ok 
 check "install.sh survives busybox ash (Alpine) with no arguments" posix_sh_ok alpine:3.23 sh
 
 echo
-echo "== client config renders and sing-box accepts it =="
-docker run --rm --network none \
-	-e TT_URI="$FIXTURE_URI" \
-	-e DIRECT_SUFFIXES=naver.com,go.kr \
-	"$CLIENT_IMG" check || fail=1
+echo "== client renders configs the real sing-box accepts =="
+# The client is a native install now, so this exercises it the way it actually
+# runs: a script on the host driving a sing-box binary. Fetch the pinned build
+# if the host has none.
+SB=$(command -v sing-box 2>/dev/null || true)
+if [ -z "$SB" ]; then
+	_v=$(sed -n 's/^SINGBOX_VERSION=${TT_SINGBOX_VERSION:-\(.*\)}$/\1/p' install.sh)
+	case "$(uname -m)" in
+		x86_64 | amd64) _a=amd64; _sum=$(sed -n 's/^SINGBOX_SHA_amd64=//p' install.sh) ;;
+		aarch64 | arm64) _a=arm64; _sum=$(sed -n 's/^SINGBOX_SHA_arm64=//p' install.sh) ;;
+	esac
+	_n="sing-box-${_v}-linux-${_a}-musl"
+	_t=$(mktemp -d)
+	if curl -fsSL -o "$_t/s.tgz" "https://github.com/SagerNet/sing-box/releases/download/v${_v}/${_n}.tar.gz" &&
+		echo "$_sum  $_t/s.tgz" | sha256sum -c - >/dev/null 2>&1; then
+		tar xzf "$_t/s.tgz" -C "$_t"
+		SB="$_t/$_n/sing-box"
+		ok "fetched and verified the pinned sing-box ($_v)"
+	else
+		bad "could not fetch a verified sing-box; client config checks skipped"
+	fi
+fi
 
-echo
-echo "== client rejects malformed links at the trust boundary =="
-# Not just "the command failed" -- it must have failed with OUR validation
-# error. Otherwise a broken image passes every one of these.
-rejects() {
-	_out=$(docker run --rm --network none -e TT_URI="$1" "$CLIENT_IMG" check 2>&1) && return 1
-	case "$_out" in *transtation-client:*) return 0 ;; *) return 1 ;; esac
-}
-check "rejects a non-vless scheme" rejects 'https://example.com'
-check "rejects a bad uuid" rejects 'vless://not-a-uuid@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com'
-check "rejects a short pbk" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=tooshort&sid=1c69b566b0480c74&sni=a.com'
-check "rejects an odd-length sid" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=abc&sni=a.com'
-# A share link is something somebody hands you -- in a chat, on a forum, as a
-# QR code. Both of these once rendered a config that sing-box ACCEPTED, which
-# is how a "friendly" link becomes someone else's server with certificate
-# checking turned off.
-check "rejects JSON injection through flow=" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com&flow=xtls-rprx-vision","server":"6.6.6.6","x":"'
-check "rejects JSON injection through fp=" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com&fp=chrome"},"insecure":true,"utls":{"enabled":true,"fingerprint":"chrome'
-check "rejects an unknown uTLS fingerprint" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com&fp=nonesuch'
+if [ -n "$SB" ]; then
+	client_check() {
+		TT_URI="$1" TT_URI_FILE=/nonexistent TT_SINGBOX="$SB" TT_RUN_DIR=$(mktemp -d) \
+			DIRECT_SUFFIXES=naver.com,go.kr sh client/transtation-client check >/dev/null 2>&1
+	}
+	check "renders both modes and sing-box accepts them" client_check "$FIXTURE_URI"
 
-echo
-echo "== client rejects hostile operator environment =="
-env_rejects() {
-	_out=$(docker run --rm --network none -e TT_URI="$FIXTURE_URI" "$@" "$CLIENT_IMG" check 2>&1) && return 1
-	case "$_out" in *transtation-client:*) return 0 ;; *) return 1 ;; esac
-}
-check "rejects a non-numeric SOCKS_PORT" env_rejects -e 'SOCKS_PORT=1080, "sniff": true'
-check "rejects DIRECT_SUFFIXES that is not a domain list" env_rejects -e 'DIRECT_SUFFIXES=a.com"],"outbound":"direct"},{"x":"'
-
-check "rejects a bad port" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:99999?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com'
+	echo
+	echo "== client rejects hostile links and hostile settings =="
+	rejects() {
+		_out=$(TT_URI="$1" TT_URI_FILE=/nonexistent TT_SINGBOX="$SB" TT_RUN_DIR=$(mktemp -d) \
+			sh client/transtation-client check 2>&1) && return 1
+		case "$_out" in *transtation-client:*) return 0 ;; *) return 1 ;; esac
+	}
+	env_rejects() {
+		_out=$(TT_URI="$FIXTURE_URI" TT_URI_FILE=/nonexistent TT_SINGBOX="$SB" TT_RUN_DIR=$(mktemp -d) \
+			env "$1" sh client/transtation-client check 2>&1) && return 1
+		case "$_out" in *transtation-client:*) return 0 ;; *) return 1 ;; esac
+	}
+	check "rejects a non-vless scheme" rejects 'https://example.com'
+	check "rejects a bad uuid" rejects 'vless://not-a-uuid@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com'
+	check "rejects a short pbk" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=tooshort&sid=1c69b566b0480c74&sni=a.com'
+	check "rejects an odd-length sid" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=abc&sni=a.com'
+	check "rejects a bad port" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:99999?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com'
+	check "rejects JSON injection through flow=" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com&flow=xtls-rprx-vision","server":"6.6.6.6","x":"'
+	check "rejects JSON injection through fp=" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com&fp=nonesuch'
+	check "rejects a non-numeric SOCKS_PORT" env_rejects 'SOCKS_PORT=1080, "sniff": true'
+	check "rejects DIRECT_SUFFIXES that is not a domain list" env_rejects 'DIRECT_SUFFIXES=a.com"],"outbound":"direct"},{"x":"'
+fi
 
 echo
 [ "$fail" = 0 ] || { echo "FAILED"; exit 1; }

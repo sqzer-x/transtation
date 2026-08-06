@@ -4,8 +4,8 @@ Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
 container on any Linux box that has Docker.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.11/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.11 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.12/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.12 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -45,7 +45,7 @@ transtation exists because of a narrower set of preferences:
 Two-step form above is the recommended one. If you are going to pipe it anyway:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.11/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.12/install.sh | sudo sh
 ```
 
 The installer needs root, refuses anything other than x86_64/aarch64, installs
@@ -59,7 +59,7 @@ If you already run Docker and prefer to do it yourself:
 # /opt/transtation/docker-compose.yml
 services:
   proxy:
-    image: ghcr.io/sqzer-x/transtation:v1.0.11
+    image: ghcr.io/sqzer-x/transtation:v1.0.12
     container_name: transtation
     restart: unless-stopped
     ports: ["443:8443"]
@@ -106,41 +106,70 @@ opened in the instance's own iptables.
 
 ## Client
 
-You do not need this project's client at all. Any app that speaks VLESS +
-REALITY works with the link:
+You may well not need this project's client. The server prints a `vless://`
+link, and every platform already has a good client that takes one:
 
 | Platform | Use |
 |---|---|
 | Android | v2rayNG, Hiddify |
 | iOS | sing-box, Streisand, Shadowrocket |
 | Windows / macOS | v2rayN, Hiddify, sing-box |
-| Linux desktop, permanently | the native `sing-box` package plus upstream's systemd unit |
 
-The container is for headless Linux and for people who would rather not install
-anything.
+What those do not cover well is a Linux machine you want *entirely* behind the
+proxy, with a fail-closed killswitch, managed by the init system. That is what
+this client is for, and it installs natively — a verified static `sing-box`
+binary, a generated config and a systemd unit. **No Docker on the client.**
 
-### Proxy mode (default) — a local SOCKS5 + HTTP proxy
+Capturing a machine's traffic means owning its routing table. A container
+handed `--network host` and `CAP_NET_ADMIN` to do that isolates nothing; it is
+a packaging format with extra failure modes, and it excludes every phone and
+desktop anyway.
 
-**This does not put your machine behind the proxy.** It opens a proxy on
-`127.0.0.1:1080` and nothing else. Every program that should use it has to be
-pointed at it, one at a time. Your browser keeps using your own address until
-you configure it; so does everything started from your desktop, and every
-systemd service. If what you want is "all of this machine's traffic", that is
-[tun mode](#tun-mode--the-whole-host), not this.
+### Whole-host tunnel (default)
 
 ```
 sudo sh install.sh client
 ```
 
-or by hand:
+It asks for the link, verifies and installs sing-box, writes
+`transtation-client.service`, starts it, and then checks that this machine's
+public address actually **changed** — a reply on its own only proves the network
+works, which it did before you installed anything. If the address did not move,
+the installer says so and exits non-zero.
 
 ```
-install -Dm600 /dev/stdin /etc/transtation/uri   # paste the vless:// link, then Ctrl-D
-docker run -d --name transtation-client --restart unless-stopped \
-  -p 127.0.0.1:1080:1080 \
-  -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.11
+stop:    sudo systemctl stop transtation-client
+logs:    journalctl -u transtation-client -f
+panic:   sudo transtation-panic        # undo everything, needs no network
 ```
+
+Everything the machine sends goes through the tunnel with no per-program
+configuration — including traffic from containers running on it.
+
+`DIRECT_SUFFIXES` is a comma-separated list of domain suffixes that bypass the
+tunnel entirely — for sites that block proxy IPs, or a bank that objects to a
+foreign exit. Those domains also resolve locally rather than through the tunnel,
+so you get the geographically correct answer before connecting.
+
+```
+DIRECT_SUFFIXES=example.com,example.net sudo sh install.sh client --killswitch
+```
+
+Needs Linux, root and systemd. The tunnel interface is created directly on the
+host, so there is no rootless story to get wrong and nothing to be confused
+about on macOS or Windows — use one of the apps above there.
+
+### Proxy mode — a local SOCKS5 + HTTP proxy
+
+```
+sudo sh install.sh client --proxy
+```
+
+**This does not put your machine behind the proxy.** It opens a proxy on
+`127.0.0.1:1080` and nothing else. Every program that should use it has to be
+pointed at it, one at a time. Your browser keeps using your own address until
+you configure it; so does everything started from your desktop, and every
+systemd service.
 
 ```
 export ALL_PROXY=socks5h://127.0.0.1:1080
@@ -163,73 +192,17 @@ DNS locally and leaks every hostname you visit. In Firefox, set the SOCKS host
 in the connection settings and tick "Proxy DNS when using SOCKS v5" — the
 environment variables above will not reach it.
 
-No capabilities, no devices, no host networking, so nothing here needs a
-rootful container runtime — it was run under rootless Podman as well as Docker.
-
-Client-side settings, all optional:
-
-| Variable | Default | What it does |
-|---|---|---|
-| `MODE` | `proxy` | `tun` for the whole-host tunnel |
-| `SOCKS_PORT` | `1080` | port the mixed SOCKS5/HTTP inbound listens on inside the container |
-| `DIRECT_SUFFIXES` | *(empty)* | comma-separated domain suffixes that bypass the tunnel (`tun` mode) |
-| `TT_URI_FILE` | `/etc/transtation/uri` | where the share link is read from |
-| `TT_URI` | *(unset)* | the link inline — visible in `docker inspect`, so prefer the file |
-
 Two more things this mode will not do even for a program you *have* pointed at
 it: QUIC (browsers do not send UDP over SOCKS, so it silently falls back to
 TCP), and anything that reads no proxy setting at all.
 
-**No killswitch is needed here** — nothing is redirected, so if the container
-dies, proxied connections simply fail and everything else was never going
-through it in the first place. That is this mode's biggest advantage and its
-biggest limitation, and they are the same sentence.
+Settings, all optional:
 
-### Tun mode — the whole host
-<a id="tun-mode--the-whole-host"></a>
-
-This is the one that captures everything the machine sends, with no per-program
-configuration.
-
-```
-sudo sh install.sh client --tun --killswitch
-```
-
-or by hand:
-
-```
-docker run -d --name transtation-client --restart unless-stopped \
-  --network host --cap-add NET_ADMIN --device /dev/net/tun \
-  -e MODE=tun \
-  -e DIRECT_SUFFIXES=example.com,example.net \
-  -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.11
-```
-
-Exactly three extra flags. `--privileged` is **not** needed and must not be
-used. `--network host` is not optional: without it the tunnel comes up inside
-the container's own network namespace and your host's traffic is untouched.
-
-**Linux only, rootful Docker only.** On Docker Desktop (Windows, macOS)
-`--network host` joins the *virtual machine's* namespace, so tun mode there is
-not unsupported, it is architecturally incapable. Under rootless Docker or
-Podman it cannot work either: a capability held in a child user namespace does
-not authorise operations on a network namespace owned by the initial one. The
-container tests for that at startup and refuses with the reason rather than
-half-starting.
-
-Be honest with yourself about what this buys: a container with `--network host`
-and `CAP_NET_ADMIN` provides **no isolation whatsoever**, while adding the
-SELinux/AppArmor/rootless matrix and losing systemd-resolved integration (the
-container has no `resolvectl`, so sing-box falls back to hijacking port 53). For
-a permanent desktop setup the native `sing-box` package with upstream's hardened
-systemd unit is the better answer. Tun mode ships because it is genuinely useful
-on a headless box, not because it is more secure.
-
-`DIRECT_SUFFIXES` is a comma-separated list of domain suffixes that bypass the
-tunnel entirely — for sites that block proxy IPs, or a bank that objects to a
-foreign exit. Those domains also resolve locally rather than through the tunnel,
-so you get the geographically correct answer before connecting.
+| Variable | Default | What it does |
+|---|---|---|
+| `DIRECT_SUFFIXES` | *(empty)* | comma-separated domain suffixes that bypass the tunnel |
+| `SOCKS_PORT` | `1080` | proxy mode's listening port |
+| `TT_URI_FILE` | `/etc/transtation/uri` | where the share link is read from |
 
 ### Killswitch and recovery
 
@@ -265,10 +238,9 @@ If your network ever dies:
 sudo transtation-panic
 ```
 
-Small, and it needs neither a network nor Docker. It also exists as a verb of
-the client image (`docker run --rm --network host --cap-add NET_ADMIN <image>
-panic`), and the same commands are printed in the client's startup banner every
-boot, so they are in `docker logs` and in your scrollback.
+Small, and it needs neither a network nor Docker. The same commands are printed
+in the client's startup banner every boot, so they are in
+`journalctl -u transtation-client` and in your scrollback.
 
 ---
 
@@ -538,11 +510,13 @@ host's own proxy stopped, so nothing was measured through a second proxy:
   the container left `curl` timing out rather than leaking. `transtation-panic`
   restored direct egress with no rules, no interface and no table left behind,
   and without disturbing Tailscale's rules or other containers.
-- **Rootless.** `MODE=proxy` works under rootless Podman. `MODE=tun` there
-  refuses with the reason rather than half-starting; under rootful Podman it
-  works.
-- **arm64.** The published arm64 image was run as a server under emulation,
-  with a client on the other architecture passing traffic through it.
+- **The client, natively.** `install.sh client` on this laptop: verified
+  sing-box, systemd unit, tunnel up, host egress moved off the ISP address,
+  `DIRECT_SUFFIXES` domains still on their real path, other containers on the
+  host carried too, and `transtation-panic` putting it all back. Pointed at a
+  dead server it reports "still your own address" and exits non-zero.
+- **arm64.** The published arm64 server image was run under emulation with a
+  client on the other architecture passing traffic through it.
 - **Timings, measured rather than asserted.** On that VPS: 7.3 s from
   `docker compose up` to healthy on a first boot that generates keys, picks a
   dest and registers with WARP; 14.4 s to a proven-working proxy. Most of the

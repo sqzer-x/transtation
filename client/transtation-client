@@ -1,17 +1,23 @@
 #!/bin/sh
-# transtation-client -- connect to a transtation server.
+# transtation-client -- connect this host to a transtation server.
 #
-#   MODE=proxy (default)  local SOCKS5 + HTTP proxy. Unprivileged.
-#   MODE=tun              transparent whole-host tunnel. Linux, rootful.
+#   MODE=tun    (default)  the whole machine's traffic goes through the tunnel
+#   MODE=proxy             a local SOCKS5 + HTTP proxy, nothing captured
 #
-# The share link is a credential. Mount it as a file rather than passing it in
-# the environment or on the command line: argv is world-readable through
-# /proc/<pid>/cmdline and lands in shell history, and environment variables are
-# visible in `docker inspect`.
+# This runs on the host, not in a container. Capturing a machine's traffic means
+# owning its routing table, and a container that has been given --network host
+# and CAP_NET_ADMIN to do that is not isolating anything -- it is a package
+# format with extra failure modes. Phones and desktops cannot run one at all.
+# So: a static binary, a rendered config and a systemd unit.
+#
+# The share link is a credential. It is read from a file, and the generated
+# config is written under /run so it never touches the disk.
 set -eu
 
 URI_FILE=${TT_URI_FILE:-/etc/transtation/uri}
-CONF=/run/transtation.json
+RUN_DIR=${TT_RUN_DIR:-/run/transtation}
+CONF="$RUN_DIR/config.json"
+SINGBOX=${TT_SINGBOX:-sing-box}
 TUN_IFACE=tt0
 TUN_ADDR=172.19.0.1/30
 SOCKS_PORT=${SOCKS_PORT:-1080}
@@ -178,9 +184,8 @@ render_proxy() {
 	# caller using socks5h:// so the proxy resolves, plus the server address
 	# already being a literal IP.
 	#
-	# listen is 0.0.0.0 *inside the container* -- binding 127.0.0.1 there would
-	# make the published port unreachable. Loopback confinement comes from the
-	# "127.0.0.1:" prefix on the docker -p flag, which the docs always use.
+	# Loopback only. This runs on the host, so binding anything wider would put
+	# an open proxy on the network.
 	cat <<-EOF
 		{
 		  "log": { "level": "warn" },
@@ -188,7 +193,7 @@ render_proxy() {
 		    {
 		      "type": "mixed",
 		      "tag": "in",
-		      "listen": "0.0.0.0",
+		      "listen": "127.0.0.1",
 		      "listen_port": $SOCKS_PORT
 		    }
 		  ],
@@ -263,25 +268,16 @@ render_tun() {
 # --------------------------------------------------------------- preflight
 
 preflight_tun() {
-	[ -e /dev/net/tun ] || die \
-		"no /dev/net/tun in this container. Add:  --device /dev/net/tun
-    If the HOST has no tun device either:
-      sudo modprobe tun && echo tun | sudo tee /etc/modules-load.d/tun.conf
-    Do NOT add --cap-add SYS_MODULE to let the container load it."
-
-	if ! ip rule add priority 32765 from all lookup main 2>/dev/null; then
-		die "cannot manage host routing. Either --cap-add NET_ADMIN is missing, or this
-    is rootless Docker/Podman -- where MODE=tun CANNOT work at all, because a
-    capability held in a child user namespace does not authorise operations on
-    a network namespace owned by the initial user namespace. Use MODE=proxy.
-    On Fedora/RHEL also try:  sudo setsebool -P container_use_devices=true"
+	[ "$(id -u)" = 0 ] || die "MODE=tun needs root: it creates a network interface and
+    rewrites this machine's routing table. Run it under the systemd unit the
+    installer sets up, or with sudo."
+	if [ ! -e /dev/net/tun ]; then
+		modprobe tun 2>/dev/null || true
+		[ -e /dev/net/tun ] || die "no /dev/net/tun on this host, and 'modprobe tun' did not
+    create one. Load the module and make it stick:
+      modprobe tun && echo tun > /etc/modules-load.d/tun.conf"
 	fi
-	ip rule del priority 32765 2>/dev/null || true
-
-	[ -e /sys/class/net/docker0 ] || warn \
-		"docker0 is not visible from here, which usually means bridge networking.
-    MODE=tun needs --network host; without it the tunnel comes up inside the
-    container's own namespace and host traffic is untouched."
+	command -v ip >/dev/null 2>&1 || die "iproute2 is not installed; MODE=tun needs 'ip'"
 }
 
 panic_banner() {
@@ -294,7 +290,7 @@ panic_banner() {
 		        while sudo ip rule del priority \$p 2>/dev/null; do :; done
 		      done
 		      sudo ip link del $TUN_IFACE
-		  (or:  sudo transtation-panic  --  or the 'panic' verb of this image)
+		  (or simply:  sudo transtation-panic)
 
 	EOF
 }
@@ -325,51 +321,50 @@ cmd_panic() {
 cmd_run() {
 	if [ -n "${TT_URI:-}" ]; then
 		URI=$TT_URI
-		warn "reading the link from TT_URI. That is visible in 'docker inspect';
-    prefer mounting it:  -v /etc/transtation:/etc/transtation:ro"
+		warn "reading the link from TT_URI. That is visible in /proc and in this
+    process's environment; prefer the file at $URI_FILE (mode 0600)."
 	elif [ -r "$URI_FILE" ]; then
 		URI=$(cat "$URI_FILE")
 	else
-		die "no share link. Mount one:
-      install -Dm600 /dev/stdin /etc/transtation/uri   # paste the vless:// link
-      docker run ... -v /etc/transtation:/etc/transtation:ro ..."
+		die "no share link. Put one where this can read it:
+      install -Dm600 /dev/stdin $URI_FILE   # paste the vless:// link, then Ctrl-D"
 	fi
 
 	parse_uri "$URI"
 	validate
 
-	case "${MODE:-proxy}" in
-		proxy)
-			render_proxy >"$CONF"
-			;;
+	mkdir -p "$RUN_DIR"
+	chmod 700 "$RUN_DIR"
+	case "${MODE:-tun}" in
 		tun)
 			preflight_tun
 			render_tun >"$CONF"
 			;;
-		*) die "MODE must be 'proxy' or 'tun', got: ${MODE:-}" ;;
+		proxy)
+			render_proxy >"$CONF"
+			;;
+		*) die "MODE must be 'tun' or 'proxy', got: $(q "${MODE:-}")" ;;
 	esac
+	chmod 600 "$CONF"
 
-	sing-box check -c "$CONF" || die "generated config rejected by $(sing-box version | head -1)"
+	"$SINGBOX" check -c "$CONF" || die "generated config rejected by $("$SINGBOX" version | head -1)"
 
 	printf '\n  transtation-client\n'
 	printf '  server   %s:%s  (sni %s)\n' "$SERVER_IP" "$PORT" "$SNI"
-	case "${MODE:-proxy}" in
-		proxy)
-			printf '  mode     proxy -- SOCKS5 + HTTP on :%s inside the container\n' "$SOCKS_PORT"
-			printf '  use it   export ALL_PROXY=socks5h://127.0.0.1:%s\n' "$SOCKS_PORT"
-			printf '           the "h" matters: plain socks5:// resolves DNS locally and leaks\n'
-			printf '           every hostname you visit.\n'
-			printf '  no killswitch is needed in this mode: nothing is redirected, so if this\n'
-			printf '  container dies, proxied connections simply fail.\n\n'
-			;;
+	case "${MODE:-tun}" in
 		tun)
-			printf '  mode     tun -- whole-host transparent tunnel on %s\n' "$TUN_IFACE"
+			printf '  mode     tun -- everything this machine sends goes through the tunnel\n'
 			printf '  direct   %s\n' "${DIRECT_SUFFIXES:-(none)}"
 			panic_banner
 			;;
+		proxy)
+			printf '  mode     proxy -- SOCKS5 + HTTP on 127.0.0.1:%s, nothing is captured\n' "$SOCKS_PORT"
+			printf '           each program has to be pointed at it; MODE=tun is the one\n'
+			printf '           that covers the whole machine.\n\n'
+			;;
 	esac
 
-	exec sing-box run -c "$CONF"
+	exec "$SINGBOX" run -c "$CONF"
 }
 
 case "${1:-run}" in
@@ -378,12 +373,13 @@ case "${1:-run}" in
 	check)
 		# Render both modes and validate them. Used by test.sh; needs no network
 		# beyond resolving the server name, so `check` accepts a literal IP link.
+		RUN_DIR=${TT_RUN_DIR:-$(mktemp -d)}; CONF="$RUN_DIR/config.json"
 		URI=${TT_URI:-$(cat "$URI_FILE")}
 		parse_uri "$URI"
 		validate
-		render_proxy >"$CONF" && sing-box check -c "$CONF" && echo "  ok    proxy-mode config accepted by sing-box"
+		render_proxy >"$CONF" && "$SINGBOX" check -c "$CONF" && echo "  ok    proxy-mode config accepted by sing-box"
 		DIRECT_SUFFIXES=${DIRECT_SUFFIXES:-example.com,example.net} render_tun >"$CONF" &&
-			sing-box check -c "$CONF" && echo "  ok    tun-mode config accepted by sing-box"
+			"$SINGBOX" check -c "$CONF" && echo "  ok    tun-mode config accepted by sing-box"
 		;;
 	*) die "unknown command: $1 (expected run, panic or check)" ;;
 esac

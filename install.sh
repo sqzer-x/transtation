@@ -15,14 +15,21 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.11}
+VERSION=${TT_VERSION:-v1.0.12}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.11, and the hash-verified installer you read would vouch for nothing.
+# v1.0.12, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
+
+# sing-box ships no checksum file, so these were computed once from the official
+# release artifacts and are reviewed as part of this repo. The -musl builds are
+# statically linked, so one binary runs on any distribution.
+SINGBOX_VERSION=${TT_SINGBOX_VERSION:-1.13.16}
+SINGBOX_SHA_amd64=9ff0345fde4157a6bdab45a615668d41ccc93f6d0f361108042a48b8a49a9baa
+SINGBOX_SHA_arm64=3ea951c68f2eea10fd3ee8f8cc7794c12ccc7405afa99279a79e0b41cb183adf
 
 DIR=${TT_DIR:-/opt/transtation}
 URI_DIR=/etc/transtation
@@ -281,19 +288,76 @@ install_wrapper() {
 
 # ------------------------------------------------------------------ client
 
+# Run from a git checkout, or piped from the internet -- fetch what is missing.
+client_script() {
+	_d=$(dirname -- "$0" 2>/dev/null || echo .)
+	if [ -r "$_d/client/transtation-client" ]; then
+		printf '%s' "$_d/client/transtation-client"
+		return 0
+	fi
+	_f=$(mktemp)
+	curl -fsSL "$RAW/client/transtation-client" -o "$_f" ||
+		die "could not fetch the client from $RAW"
+	printf '%s' "$_f"
+}
+
+install_panic() {
+	install -Dm0755 /dev/stdin /usr/local/sbin/transtation-panic <<-'EOF'
+		#!/bin/sh
+		set -u
+		TUN_IFACE=${TUN_IFACE:-tt0}
+		nft delete table inet transtation 2>/dev/null
+		nft delete table ip6 transtation 2>/dev/null
+		for f in -4 -6; do
+		  ip $f rule list 2>/dev/null | sed -n 's/^\(90[0-9][0-9]\):.*/\1/p' | while read -r p; do
+		    ip $f rule del priority "$p" 2>/dev/null
+		  done
+		done
+		ip route flush table 2022 2>/dev/null
+		ip -6 route flush table 2022 2>/dev/null
+		ip link del "$TUN_IFACE" 2>/dev/null
+		systemctl stop transtation-client 2>/dev/null
+		echo "killswitch removed, policy routing flushed. You are back on direct egress."
+	EOF
+}
+
+install_sing_box() {
+	command -v sing-box >/dev/null 2>&1 && [ -z "${TT_FORCE_SINGBOX:-}" ] && {
+		step sing-box "$(sing-box version | head -1)  (already installed)"
+		SINGBOX=$(command -v sing-box)
+		return 0
+	}
+	case "$(uname -m)" in
+		x86_64 | amd64) _a=amd64; _sum=$SINGBOX_SHA_amd64 ;;
+		aarch64 | arm64) _a=arm64; _sum=$SINGBOX_SHA_arm64 ;;
+	esac
+	_n="sing-box-${SINGBOX_VERSION}-linux-${_a}-musl"
+	_t=$(mktemp -d)
+	curl -fsSL -o "$_t/sb.tgz" \
+		"https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/${_n}.tar.gz" ||
+		die "could not download sing-box ${SINGBOX_VERSION}"
+	echo "$_sum  $_t/sb.tgz" | sha256sum -c - >/dev/null 2>&1 ||
+		{ rm -rf "$_t"; die "sing-box checksum mismatch -- refusing to install it"; }
+	tar xzf "$_t/sb.tgz" -C "$_t"
+	install -Dm0755 "$_t/$_n/sing-box" /usr/local/bin/sing-box
+	rm -rf "$_t"
+	SINGBOX=/usr/local/bin/sing-box
+	step sing-box "$($SINGBOX version | head -1)  (verified, statically linked)"
+}
+
 install_client() {
 	need_root
 	check_arch
-	_tun=0 _ks=0 _uri=""
+	_mode=tun _ks=0 _uri=""
 	for a in "$@"; do
 		case "$a" in
-			--tun) _tun=1 ;;
+			--tun) _mode=tun ;;
+			--proxy) _mode=proxy ;;
 			--killswitch) _ks=1 ;;
 			vless://*) _uri=$a ;;
 			*) die "unknown option: $a" ;;
 		esac
 	done
-	[ "$_ks" = 0 ] || [ "$_tun" = 1 ] || die "--killswitch only makes sense together with --tun"
 
 	say ""
 	say "  transtation client $VERSION"
@@ -316,64 +380,76 @@ install_client() {
 		step link "reusing $URI_DIR/uri"
 	fi
 
-	install_docker
-	docker rm -f transtation-client >/dev/null 2>&1 || true
+	install_sing_box
+	install -Dm0755 "$(client_script)" /usr/local/bin/transtation-client
+	install_panic
+	step scripts "installed /usr/local/bin/transtation-client and /usr/local/sbin/transtation-panic"
 
-	if [ "$_tun" = 1 ]; then
-		step mode "tun -- whole-host transparent tunnel"
-		set --
-		[ -n "${DIRECT_SUFFIXES:-}" ] && set -- -e "DIRECT_SUFFIXES=$DIRECT_SUFFIXES"
-		docker run -d --name transtation-client --restart unless-stopped \
-			--network host --cap-add NET_ADMIN --device /dev/net/tun \
-			-e MODE=tun "$@" \
-			-v "$URI_DIR":"$URI_DIR":ro \
-			"$(client_image)" >/dev/null
-		install -Dm0755 /dev/stdin /usr/local/sbin/transtation-panic <<-'EOF'
-			#!/bin/sh
-			set -u
-			TUN_IFACE=${TUN_IFACE:-tt0}
-			nft delete table inet transtation 2>/dev/null
-			nft delete table ip6 transtation 2>/dev/null
-			for f in -4 -6; do
-			  ip $f rule list 2>/dev/null | sed -n 's/^\(90[0-9][0-9]\):.*/\1/p' | while read -r p; do
-			    ip $f rule del priority "$p" 2>/dev/null
-			  done
-			done
-			ip route flush table 2022 2>/dev/null
-			ip -6 route flush table 2022 2>/dev/null
-			ip link del "$TUN_IFACE" 2>/dev/null
-			docker rm -f transtation-client 2>/dev/null >/dev/null
-			echo "killswitch removed, policy routing flushed. You are back on direct egress."
-		EOF
-		step panic "installed /usr/local/sbin/transtation-panic"
-		if [ "$_ks" = 1 ]; then
-			curl -fsSL "$RAW/host/transtation-killswitch" -o /usr/local/sbin/transtation-killswitch 2>/dev/null ||
-				die "could not fetch the killswitch script from $RAW"
-			chmod 0755 /usr/local/sbin/transtation-killswitch
-			/usr/local/sbin/transtation-killswitch on
-		fi
-	else
-		step mode "proxy -- local SOCKS5 + HTTP on 127.0.0.1:1080"
-		docker run -d --name transtation-client --restart unless-stopped \
-			-p 127.0.0.1:1080:1080 \
-			-v "$URI_DIR":"$URI_DIR":ro \
-			"$(client_image)" >/dev/null
+	# Taken before the tunnel exists, so the self-test can tell "the tunnel is
+	# carrying traffic" from "a request happened to succeed". Without this the
+	# check passes while routing is still settling and the answer came out the
+	# ordinary way -- observed, and reported as success.
+	_before=$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)
+
+	[ -d /run/systemd/system ] || die "this needs systemd to manage the client.
+    Without it, run it yourself:
+      MODE=$_mode /usr/local/bin/transtation-client run"
+
+	cat >/etc/systemd/system/transtation-client.service <<-EOF
+		[Unit]
+		Description=transtation client ($_mode)
+		After=network-online.target
+		Wants=network-online.target
+
+		[Service]
+		Type=simple
+		Environment=MODE=$_mode
+		Environment=TT_SINGBOX=$SINGBOX
+		${DIRECT_SUFFIXES:+Environment=DIRECT_SUFFIXES=$DIRECT_SUFFIXES}
+		ExecStart=/usr/local/bin/transtation-client run
+		Restart=on-failure
+		RestartSec=3s
+		RuntimeDirectory=transtation
+		RuntimeDirectoryMode=0700
+		# Root is needed to own the routing table in tun mode; the bounding set
+		# keeps that to what sing-box actually uses.
+		CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_READ_SEARCH
+		NoNewPrivileges=true
+		ProtectHome=true
+		ProtectSystem=strict
+		ReadWritePaths=/run/transtation
+
+		[Install]
+		WantedBy=multi-user.target
+	EOF
+	systemctl daemon-reload
+	systemctl enable --now transtation-client.service >/dev/null 2>&1 || true
+	step service "transtation-client.service enabled ($_mode mode)"
+
+	if [ "$_ks" = 1 ]; then
+		[ "$_mode" = tun ] || die "--killswitch only makes sense with the whole-host tunnel"
+		curl -fsSL "$RAW/host/transtation-killswitch" -o /usr/local/sbin/transtation-killswitch ||
+			die "could not fetch the killswitch script from $RAW"
+		chmod 0755 /usr/local/sbin/transtation-killswitch
+		/usr/local/sbin/transtation-killswitch on
 	fi
 
 	printf '  %-14s' self-test
-	# The result has to be captured and tested. An earlier version piped curl
-	# into grep into tr with `|| printf "no answer yet"` on the end -- which hangs
-	# off `tr`, the last command in the pipeline, and `tr` always succeeds. The
-	# fallback could never fire, so a client that was not passing any traffic at
-	# all still finished with a success banner.
 	_probe=""
 	_n=0
-	while [ "$_n" -lt 6 ]; do
-		if [ "$_tun" = 1 ]; then
-			_probe=$(curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
-				grep -E '^(ip|warp|colo)=' | tr '\n' ' ')
+	while [ "$_n" -lt 15 ]; do
+		if [ "$_mode" = tun ]; then
+			_trace=$(curl -fsS --max-time 8 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+			_ip=$(printf '%s' "$_trace" | sed -n 's/^ip=//p')
+			# The address has to have MOVED. A reply on its own only proves the
+			# network works, which it did before any of this was installed.
+			if [ -n "$_ip" ] && [ -n "$_before" ] && [ "$_ip" != "$_before" ]; then
+				_probe=$(printf '%s' "$_trace" | grep -E '^(ip|warp|colo)=' | tr '\n' ' ')
+			elif [ -n "$_ip" ] && [ -z "$_before" ]; then
+				_probe="$(printf '%s' "$_trace" | grep -E '^(ip|warp|colo)=' | tr '\n' ' ')(could not compare: no address before install)"
+			fi
 		else
-			_probe=$(curl -fsS --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
+			_probe=$(curl -fsS --max-time 8 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
 				grep -E '^(ip|warp|colo)=' | tr '\n' ' ')
 		fi
 		[ -n "$_probe" ] && break
@@ -381,40 +457,38 @@ install_client() {
 		sleep 2
 	done
 	if [ -n "$_probe" ]; then
-		[ "$_tun" = 1 ] && say "$_probe" || say "through the proxy: $_probe"
+		[ "$_mode" = tun ] && say "$_probe" || say "through the proxy: $_probe"
 	else
-		say "NO TRAFFIC"
+		[ "$_mode" = tun ] && say "STILL YOUR OWN ADDRESS (${_before:-unknown})" || say "NO TRAFFIC"
 		say ""
-		say "  The client started but nothing is getting through. Look at:"
-		say "      docker logs transtation-client"
-		[ "$_tun" = 1 ] && say "      sudo transtation-panic     # to undo the tunnel and killswitch"
+		say "  The client is running but traffic is not going through the tunnel. Look at:"
+		say "      journalctl -u transtation-client -n 40"
+		[ "$_mode" = tun ] && say "      sudo transtation-panic     # undo the tunnel and killswitch"
 		exit 1
 	fi
 
-	if [ "$_tun" = 0 ]; then
+	if [ "$_mode" = tun ]; then
 		cat <<-'EOF'
 
-			  THIS DOES NOT PUT YOUR MACHINE BEHIND THE PROXY. It opens a proxy and
-			  nothing else; each program has to be pointed at it. Your browser and
-			  anything your desktop starts keep using your own address until you
-			  configure them. For "all of this machine's traffic", use --tun instead.
+			  Every program on this machine now goes through the tunnel, with no
+			  per-program configuration.
 
-			  export ALL_PROXY=socks5h://127.0.0.1:1080 HTTPS_PROXY=http://127.0.0.1:1080 HTTP_PROXY=http://127.0.0.1:1080
-
-			    Those apply to that shell and what it starts, and nothing else.
-			    The "h" in socks5h is load-bearing: plain socks5:// makes curl resolve DNS
-			    locally and leaks every hostname you visit. Firefox needs its own
-			    connection settings; it does not read these variables.
-			    Not covered even for a program you did point at it: QUIC (it degrades to
-			    TCP) and anything that reads no proxy setting at all.
-
-			  Whole-system tunnel instead:  sudo sh install.sh client --tun --killswitch
+			  stop:    sudo systemctl stop transtation-client
+			  logs:    journalctl -u transtation-client -f
+			  panic:   sudo transtation-panic        # undo everything, needs no network
 
 		EOF
 	else
-		say ""
-		say "  If your network ever dies:  sudo transtation-panic"
-		say ""
+		cat <<-'EOF'
+
+			  THIS DOES NOT PUT YOUR MACHINE BEHIND THE PROXY. It opens a proxy on
+			  127.0.0.1:1080 and nothing else; each program has to be pointed at it.
+			  Re-run with --tun for the whole machine.
+
+			  export ALL_PROXY=socks5h://127.0.0.1:1080 HTTPS_PROXY=http://127.0.0.1:1080 HTTP_PROXY=http://127.0.0.1:1080
+			    Those apply to that shell and what it starts, and nothing else.
+
+		EOF
 	fi
 }
 
@@ -441,13 +515,12 @@ uninstall() {
 			*) say "volume kept: 'docker volume ls | grep transtation-data'" ;;
 		esac
 	fi
-	if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx transtation-client; then
-		docker rm -f transtation-client >/dev/null
+	if [ -e /etc/systemd/system/transtation-client.service ]; then
+		systemctl disable --now transtation-client.service >/dev/null 2>&1 || true
+		rm -f /etc/systemd/system/transtation-client.service
+		systemctl daemon-reload 2>/dev/null || true
+		rm -f /usr/local/bin/transtation-client
 		say "client removed."
-	fi
-	if [ -x /usr/local/sbin/transtation-killswitch ]; then
-		/usr/local/sbin/transtation-killswitch off || true
-		rm -f /usr/local/sbin/transtation-killswitch
 	fi
 	rm -f /usr/local/sbin/transtation-panic
 	say "done. $URI_DIR was left in place; remove it yourself if you are finished with it."

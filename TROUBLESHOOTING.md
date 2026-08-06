@@ -29,9 +29,15 @@ Causes, in order of likelihood:
    (5879 bytes) is the notable trap — it looks like the safest possible choice
    and does not work. Check and replace:
    ```
+   # container
    docker compose exec proxy xray tls ping www.microsoft.com   # look at the chain length
    echo 'SNI=dl.google.com' >> /opt/transtation/.env
    cd /opt/transtation && docker compose up -d && transtation verify
+
+   # native
+   /usr/local/lib/transtation/xray tls ping www.microsoft.com
+   echo 'SNI=dl.google.com' >> /etc/transtation/server.env
+   systemctl restart transtation && transtation verify
    ```
    Known-good: `dl.google.com` (895), `www.cloudflare.com` (2493),
    `addons.mozilla.org` (2843), `www.nicovideo.jp` (3822).
@@ -47,10 +53,8 @@ Causes, in order of likelihood:
 4. **Missing `fp` in a hand-built link.** sing-box, NekoBox and Hiddify hard-fail
    with `uTLS is required by reality client`; Xray-based clients tolerate it.
    The generated link always carries `fp=chrome`.
-5. **Your SNI stopped supporting TLS 1.3 or X25519.** Check it and pick another:
-   ```
-   docker compose exec proxy xray tls ping www.microsoft.com
-   ```
+5. **Your SNI stopped supporting TLS 1.3 or X25519.** Check it and pick another
+   with the same `xray tls ping` command as above.
 
 ---
 
@@ -66,24 +70,26 @@ transtation warp register
 
 Cloudflare rate-limits registration per source IP for about fifteen minutes, so
 if you have just retried a few times, wait. If it keeps failing, either accept
-direct egress and silence the warning with `WARP=0` in `/opt/transtation/.env`,
+direct egress and silence the warning with `WARP=0` in the config file
+(`/opt/transtation/.env`, or `/etc/transtation/server.env` on a native install),
 or check that this host has working outbound HTTPS.
 
 ---
 
-## The container is `unhealthy`, but Reality itself works
+## The container is `unhealthy` (or the native service restarts), but Reality itself works
 
 Almost always: **your provider blocks outbound UDP/2408**. WARP registration is
 TCP and succeeds; the data plane is UDP and never comes up.
 
 ```
-docker compose logs proxy | grep -o 'Using .* TUN'
+docker compose logs proxy | grep -o 'Using .* TUN'     # container
+journalctl -u transtation | grep -o 'Using .* TUN'     # native
 ```
 
 It should print `Using gVisor TUN. NoKernelTun is set to true.` — that is the
 normal, expected path and it holds even if the container was given extra
 capabilities. So if you see it, the WireGuard stack is fine and the problem is
-UDP egress: set `WARP=0` in `.env` and `docker compose up -d`.
+UDP egress: set `WARP=0` in the config file and restart.
 
 If instead it prints `Using kernel TUN`, or the container dies with a
 `read-only file system` error mentioning `rp_filter`, then something removed
@@ -91,7 +97,9 @@ the `noKernelTun` pin from the generated config. That is a transtation bug —
 please report it.
 
 Docker does not restart unhealthy containers by itself. `unhealthy` is a report,
-not a self-heal.
+not a self-heal. The native install has no healthcheck at all — it is a plain
+systemd service, so `systemctl status transtation` and the log are the whole
+story there.
 
 ---
 
@@ -103,25 +111,40 @@ Nothing is reaching Xray. The healthcheck cannot detect this — it only proves
 1. Open TCP 443 in your **provider's** firewall or security group. This is the
    answer roughly nine times out of ten.
 2. Oracle Cloud also needs it opened in the instance's own iptables.
-3. Docker's published ports **bypass `ufw`** in both directions, so a ufw rule
-   neither helps nor hurts. Do not go looking there.
+3. On the **container** path, Docker's published ports **bypass `ufw`** in both
+   directions, so a ufw rule neither helps nor hurts — do not go looking there.
+   On the **native** path there is no such shortcut: a host firewall does apply,
+   so check `ufw status` / `firewall-cmd --list-all` too.
 4. Confirm something is actually listening:
    ```
-   docker compose ps
+   docker compose ps            # container
+   systemctl status transtation # native
    ss -tlnp | grep :443
    ```
 
 ---
 
-## Tun mode: the container starts and exits, or the host's traffic is untouched
+## The client runs, but the host's traffic is untouched
 
-Read the startup message — each impossible situation gets its own sentence.
+The installer checks for this and exits non-zero rather than claiming success:
+if your public address did not move, it says `STILL YOUR OWN ADDRESS`. Start
+with the log, which names the reason:
+
+```
+journalctl -u transtation-client -n 40
+```
 
 | Message | Meaning |
 |---|---|
-| `no /dev/net/tun in this container` | add `--device /dev/net/tun`. If the *host* has none: `sudo modprobe tun && echo tun \| sudo tee /etc/modules-load.d/tun.conf` |
-| `cannot manage host routing` | either `--cap-add NET_ADMIN` is missing, or this is rootless Docker/Podman, where tun mode cannot work at all. Use proxy mode. On Fedora/RHEL also try `sudo setsebool -P container_use_devices=true` |
-| `docker0 is not visible` | you are on bridge networking. Add `--network host`, or the tunnel comes up in the container's own namespace and your host never uses it |
+| `MODE=tun needs root` | run it with `sudo`. Creating a network interface and routing rules is not something an unprivileged process can do |
+| `no /dev/net/tun on this host` | the kernel module is not loaded: `sudo modprobe tun && echo tun \| sudo tee /etc/modules-load.d/tun.conf`. Some minimal VPS and container-based hosts (OpenVZ, LXC) do not offer it at all — use proxy mode there |
+| `iproute2 is not installed` | install it; `ip` is what creates the routes |
+| `generated config rejected by sing-box` | the share link produced something sing-box will not accept. Reissue it with `transtation show` and never hand-edit it |
+
+If you installed with `--proxy` instead of the default, this is not a fault:
+proxy mode opens `127.0.0.1:1080` and deliberately changes nothing else. Only
+programs you point at it use the tunnel. Reinstall without `--proxy` for a
+whole-host tunnel.
 
 ---
 
@@ -159,7 +182,7 @@ That is WARP's shared exit pool, not a bug. Either route that site around the
 tunnel:
 
 ```
-docker run ... -e DIRECT_SUFFIXES=thatsite.com,othersite.net ...
+DIRECT_SUFFIXES=thatsite.com,othersite.net sudo sh install.sh client
 ```
 
 or turn WARP off entirely (`WARP=0`) so you egress from your own VPS address.
@@ -171,9 +194,9 @@ or turn WARP off entirely (`WARP=0`) so you egress from your own VPS address.
 If you have a backup, it is one command into a fresh volume:
 
 ```
-cd /opt/transtation && docker compose down
+cd /opt/transtation && docker compose down     # native: systemctl stop transtation
 transtation restore /root/transtation-backup.tgz
-docker compose up -d && transtation verify
+docker compose up -d && transtation verify     # native: systemctl start transtation
 ```
 
 This started life as a documented `tar` one-liner and failed twice in testing,

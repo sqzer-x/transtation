@@ -83,6 +83,48 @@ check "the compose block sets no-new-privileges" present_in_compose "no-new-priv
 check "the compose block mounts the root filesystem read-only" present_in_compose "read_only"
 
 
+# The README says `transtation <verb>` means the same thing on both install
+# paths. The native wrapper was a pure passthrough once, so `backup` printed a
+# tarball of the Reality private key to the terminal and `restore` did not exist
+# -- and redirecting it by hand produced a 0644 file, because root's umask is
+# 022. Both wrappers must carry the same three verbs, and backup must be 0600.
+wrapper_native() {
+	awk '/install -Dm0755 \/dev\/stdin \/usr\/local\/bin\/transtation <<-.WRAP./{f=1;next}
+	     f && /^\tWRAP$/{exit} f' install.sh | sed 's/^\t\t//'
+}
+wrapper_parity() {
+	for _v in backup restore logs; do
+		wrapper_native | grep -q "^  $_v)" || return 1
+		grep -q "^		  $_v)" install.sh || return 1
+	done
+}
+wrapper_backup_is_0600() (
+	_t=$(mktemp -d) || return 1
+	trap 'rm -rf "$_t"' EXIT
+	mkdir -p "$_t/bin" "$_t/lib" "$_t/data"
+	wrapper_native | sed "s#^D=/var/lib/transtation#D=$_t/data#; s#^L=/usr/local/lib/transtation#L=$_t/lib#" \
+		>"$_t/bin/transtation"
+	printf '#!/bin/sh\ntar czf - -C "$TT_DATA" state.env\n' >"$_t/lib/server"
+	# Take the already-the-service-user branch, so no privilege drop is needed.
+	printf '#!/bin/sh\n[ "$1" = -un ] && { echo transtation; exit 0; }\nexec /usr/bin/id "$@"\n' >"$_t/bin/id"
+	chmod +x "$_t/bin/transtation" "$_t/bin/server" "$_t/lib/server" "$_t/bin/id" 2>/dev/null
+	: >"$_t/data/state.env"
+	PATH="$_t/bin:$PATH"
+	# root's umask is what made this a real hole; reproduce it.
+	umask 022
+	transtation backup "$_t/b.tgz" >/dev/null 2>&1 || return 1
+	[ "$(stat -c %a "$_t/b.tgz")" = 600 ] || return 1
+	# and it must refuse to overwrite, rather than silently replace an old one
+	transtation backup "$_t/b.tgz" >/dev/null 2>&1 && return 1
+	# a file that is not a backup must be refused before anything is unpacked
+	echo junk | gzip >"$_t/junk.tgz"
+	transtation restore "$_t/junk.tgz" >/dev/null 2>&1 && return 1
+	return 0
+)
+check "both install paths implement the same transtation verbs" wrapper_parity
+check "native backup is 0600 even under root's umask, and will not clobber" wrapper_backup_is_0600
+
+
 if ! command -v docker >/dev/null 2>&1; then
 	echo
 	echo "  skip  image builds and runtime checks (docker not installed)"

@@ -15,11 +15,11 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.16}
+VERSION=${TT_VERSION:-v1.0.17}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.16, and the hash-verified installer you read would vouch for nothing.
+# v1.0.17, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 
 # sing-box ships no checksum file, so these were computed once from the official
@@ -217,17 +217,53 @@ install_server_native() {
 	# Every command has to run as the service user. Run as root, the script would
 	# create root-owned files in the state directory and the service -- which is
 	# not root -- would stop being able to read its own identity.
+	# backup/restore/logs are handled here rather than passed through, so that
+	# `transtation <verb>` means the same thing on both install paths -- the
+	# container wrapper below implements exactly these three the same way.
 	install -Dm0755 /dev/stdin /usr/local/bin/transtation <<-'WRAP'
 		#!/bin/sh
 		set -eu
-		if [ "$(id -un)" = transtation ]; then
-		  exec env TT_DATA=/var/lib/transtation PATH=/usr/local/lib/transtation:$PATH /usr/local/lib/transtation/server "$@"
-		fi
-		[ "$(id -u)" = 0 ] || { echo "transtation: run this as root or as the transtation user" >&2; exit 1; }
-		if command -v runuser >/dev/null 2>&1; then
-		  exec runuser -u transtation -- env TT_DATA=/var/lib/transtation PATH=/usr/local/lib/transtation:$PATH /usr/local/lib/transtation/server "$@"
-		fi
-		exec su -s /bin/sh transtation -c 'exec env TT_DATA=/var/lib/transtation PATH=/usr/local/lib/transtation:$PATH /usr/local/lib/transtation/server "$@"' -- sh "$@"
+		D=/var/lib/transtation
+		L=/usr/local/lib/transtation
+		asuser() {
+		  if [ "$(id -un)" = transtation ]; then
+		    env TT_DATA=$D PATH=$L:"$PATH" $L/server "$@"
+		  elif command -v runuser >/dev/null 2>&1; then
+		    runuser -u transtation -- env TT_DATA=$D PATH=$L:"$PATH" $L/server "$@"
+		  else
+		    su -s /bin/sh transtation -c "exec env TT_DATA=$D PATH=$L:\$PATH $L/server \"\$@\"" -- sh "$@"
+		  fi
+		}
+		[ "$(id -un)" = transtation ] || [ "$(id -u)" = 0 ] ||
+		  { echo "transtation: run this as root or as the transtation user" >&2; exit 1; }
+		case "${1:-}" in
+		  backup)
+		    f=${2:-/root/transtation-backup.tgz}
+		    [ -e "$f" ] && { echo "$f exists -- refusing to overwrite" >&2; exit 1; }
+		    # root's umask is 022 on every target distro, which would leave a
+		    # world-readable tarball of your Reality private key, your WARP private
+		    # key and your WARP bearer token.
+		    umask 077
+		    asuser backup > "$f"
+		    echo "backed up to $f (mode 0600): reality key, users, WARP account."
+		    ;;
+		  restore)
+		    f=${2:-}
+		    [ -n "$f" ] && [ -r "$f" ] || { echo "usage: transtation restore <backup.tgz>" >&2; exit 1; }
+		    tar tzf "$f" 2>/dev/null | grep -q '^state.env$' ||
+		      { echo "$f does not look like a transtation backup" >&2; exit 1; }
+		    systemctl is-active --quiet transtation &&
+		      { echo "stop the server first:  systemctl stop transtation" >&2; exit 1; }
+		    # Unpacked as root, then handed back: the service user cannot create
+		    # files it does not already own, and tar would restore archived uids
+		    # that need not match this host's.
+		    tar xzf "$f" -C "$D"
+		    chown -R transtation:transtation "$D"
+		    echo "restored. start it again:  systemctl start transtation"
+		    ;;
+		  logs) shift; exec journalctl -u transtation "$@" ;;
+		  *) asuser "$@" ;;
+		esac
 	WRAP
 	step config "wrote /etc/transtation/server.env, data in /var/lib/transtation"
 

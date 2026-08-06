@@ -6,8 +6,8 @@ the client is a native install, because putting a machine behind a proxy means
 owning its routing table and a container is the wrong shape for that.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.16/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.16 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.17/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.17 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -28,8 +28,9 @@ Telegram bot, **use 3x-ui and stop reading here.**
 
 transtation exists because of a narrower set of preferences:
 
-- **A published, digest-pinned image**, not a 2,700-line bash generator you run
-  on your host.
+- **A published, digest-pinned image** if you want one, rather than a
+  2,700-line bash generator that writes your config on the host. The native
+  path is the same program with a systemd unit, not a second codebase.
 - **Zero capabilities.** The container holds no `NET_ADMIN`, mounts no
   `/dev/net/tun`, and does not use host networking. WARP runs in Xray's
   in-process userspace network stack.
@@ -48,8 +49,8 @@ how you feel about a container runtime on your VPS.
 ### In a container (default)
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.16/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.16 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.17/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.17 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -114,10 +115,13 @@ drop and clients reconnect on their own; Xray has no config reload signal.
 
 The healthcheck only proves **outbound** traffic works. Nothing on the server
 can prove inbound does. If clients time out and the server log shows nothing at
-all, open TCP 443 in your provider's firewall or security group. Note that
-Docker's published ports **bypass `ufw`** in both directions, so a ufw rule is
-neither necessary nor sufficient; Oracle Cloud additionally needs the port
-opened in the instance's own iptables.
+all, open TCP 443 in your provider's firewall or security group. Oracle Cloud
+additionally needs the port opened in the instance's own iptables.
+
+Note the difference between the two install paths here: Docker's published
+ports **bypass `ufw`** in both directions, so on the container path a ufw rule
+is neither necessary nor sufficient. The native path has no such shortcut — a
+host firewall applies to it normally and must permit the port.
 
 ---
 
@@ -263,8 +267,9 @@ in the client's startup banner every boot, so they are in
 
 ## Configuration
 
-Nothing is required. Copy `.env.example` to `/opt/transtation/.env` and set only
-what you want to change; every value is read fresh on each boot.
+Nothing is required. Copy `.env.example` to `/opt/transtation/.env` — or, on a
+native install, to `/etc/transtation/server.env` — and set only what you want to
+change; every value is read fresh on each boot.
 
 | Variable | Default | What it does |
 |---|---|---|
@@ -332,7 +337,7 @@ From a Korean VPS it picks a Korean streaming service; with `CLIENT_REGION=JP`
 it picks `www.nicovideo.jp`; with no region it can determine at all, a global
 streaming brand.
 
-**The choice is sticky.** It lives in the data volume, is included in backups,
+**The choice is sticky.** It lives with your identity, is included in backups,
 and is never re-picked on its own — every share link carries `sni=`, so
 silently changing it would break every client you have already handed out.
 Re-picking is explicit, and says what it invalidates:
@@ -347,9 +352,9 @@ Setting `SNI=` in `.env` overrides all of it, permanently.
 ### Why the size of a certificate matters
 
 **Above roughly 5200 bytes of certificate chain the REALITY handshake does not
-complete**, and the failure is silent in the worst way: the container reports
-healthy, the port listens, and every client is quietly handed the real website
-instead of your proxy. Measured end to end against Xray 26.3.27:
+complete**, and the failure is silent in the worst way: the server reports
+itself healthy, the port listens, and every client is quietly handed the real
+website instead of your proxy. Measured end to end against Xray 26.3.27:
 
 | dest | chain | | dest | chain |
 |---|---|---|---|---|
@@ -375,7 +380,8 @@ Apple and iCloud domains are rejected outright — Xray warns that they get your
 IP blocked by the GFW. To inspect a candidate yourself:
 
 ```
-docker compose exec proxy xray tls ping example.com
+docker compose exec proxy xray tls ping example.com          # container
+/usr/local/lib/transtation/xray tls ping example.com         # native
 ```
 
 ---
@@ -393,7 +399,7 @@ front to do it.
 | `cap_add: NET_ADMIN` | no | the generated config pins `"noKernelTun": true`, so WARP always runs in Xray's in-process userspace stack regardless of what the container holds. Adding the capability buys nothing and widens the container's privileges. |
 | `--device /dev/net/tun` | no | the userspace network stack needs no TUN device |
 | `CAP_NET_BIND_SERVICE` | container: no | it listens on 8443 inside; `-p 443:8443` does the privileged bind in dockerd, which also keeps this working under rootless Docker |
-| `--network host` | no, and must not be used | it would expose the loopback SOCKS inbound the healthcheck uses, turning your server into an open relay |
+| `--network host` | no, and must not be used | the healthcheck's SOCKS inbound is bound to `127.0.0.1`, which inside the container reaches nothing. On the host's loopback the same listener becomes an unauthenticated proxy into your tunnel for every local process and everyone with a shell on the box. |
 
 For reference, a hand-rolled native Xray unit typically holds `CAP_NET_ADMIN`
 *and* `CAP_NET_BIND_SERVICE` with a writable root filesystem. The `NET_ADMIN`
@@ -405,7 +411,7 @@ probes for `CAP_NET_ADMIN` and takes the kernel-TUN path when it finds it — an
 device, which fails on Docker's read-only `/proc/sys` with no fallback. Pinning
 it makes behaviour independent of capabilities.
 
-To confirm:To confirm:
+To confirm:
 
 ```
 docker compose logs proxy | grep -o 'Using .* TUN'      # container
@@ -465,9 +471,9 @@ It is the only thing on the box you cannot regenerate. Restoring is one command
 into a fresh volume:
 
 ```
-cd /opt/transtation && docker compose down
+cd /opt/transtation && docker compose down     # native: systemctl stop transtation
 transtation restore /root/transtation-backup.tgz
-docker compose up -d && transtation verify
+docker compose up -d && transtation verify     # native: systemctl start transtation
 ```
 
 This started life as a documented `tar` one-liner and failed twice in testing,
@@ -475,9 +481,11 @@ so it is a command now. Getting it right by hand means knowing that Docker
 seeds a fresh named volume with the ownership of the image directory it is
 first mounted into — so unpacking with a generic image leaves `/data` owned by
 root and the server refuses to start — *and* that the backup is mode 0600, so
-the unpacking container has to run as root to read it at all. `restore` also
-refuses to run while the server is up, and refuses a file that is not a
-transtation backup.
+the unpacking container has to run as root to read it at all. The native path
+has the mirror-image version of the same trap: unpacked as root, the files come
+out owned by root and the service user can no longer read its own identity.
+`restore` also refuses to run while the server is up, and refuses a file that is
+not a transtation backup.
 
 Upgrades: re-run `install.sh` (with `server --native` if that is how you
 installed), or `docker compose pull && docker compose up -d`.
@@ -488,8 +496,9 @@ the new image every boot, so schema changes come along for free.
 sudo sh install.sh --uninstall
 ```
 
-It removes the containers and the compose file, and asks separately before
-deleting the data volume.
+It removes whichever server is installed — containers and compose file, or the
+systemd unit and `/usr/local/lib/transtation` — and asks separately before
+deleting your data. Binaries it did not install are left alone.
 
 ---
 
@@ -527,21 +536,21 @@ host's own proxy stopped, so nothing was measured through a second proxy:
 - **Server on a real VPS.** `install.sh` on Ubuntu 24.04: installs Docker,
   pulls and digest-pins the image, and `verify` completes a REALITY handshake
   reporting `warp=on colo=NRT`.
-- **Client to server across the internet, no tunnels.** Client container in
-  Korea to a Tokyo VPS with the host's own proxy stopped, so nothing was
-  measured through a second proxy. Steady-state request latency ≈0.20 s,
-  throughput 6.5–8.3 MB/s for a 10 MB download, and 0.9 s from `docker run` to
-  the first byte through the tunnel.
+- **Client to server across the internet, no tunnels.** A client in Korea to a
+  Tokyo VPS with the host's own proxy stopped, so nothing was measured through a
+  second proxy. Steady-state request latency ≈0.20 s, throughput 6.5–8.3 MB/s
+  for a 10 MB download, and 0.9 s from starting the client to the first byte
+  through the tunnel.
 - **The camouflage, from outside.** `openssl s_client` against the server on
   :443 returns a genuine `C=JP, O=TVer INC., CN=*.tver.jp` certificate over
   TLS 1.3 — the dest the auto-selection chose for a Japanese server, unprompted.
 - **Users.** Added a second user, connected as them, revoked them; their client
   stopped working and the first one kept going.
-- **Whole-host tunnel.** `MODE=tun` moved the host's egress from its ISP address
-  to WARP, kept `DIRECT_SUFFIXES` domains on their real path, and `SIGKILL` of
-  the container left `curl` timing out rather than leaking. `transtation-panic`
-  restored direct egress with no rules, no interface and no table left behind,
-  and without disturbing Tailscale's rules or other containers.
+- **Whole-host tunnel.** It moved the host's egress from its ISP address to
+  WARP, kept `DIRECT_SUFFIXES` domains on their real path, and `SIGKILL` of the
+  client left `curl` timing out rather than leaking. `transtation-panic` restored
+  direct egress with no rules, no interface and no table left behind, and without
+  disturbing Tailscale's rules or other containers.
 - **The client, natively.** `install.sh client` on this laptop: verified
   sing-box, systemd unit, tunnel up, host egress moved off the ISP address,
   `DIRECT_SUFFIXES` domains still on their real path, other containers on the
@@ -562,8 +571,8 @@ git clone https://github.com/sqzer-x/transtation && cd transtation
 sh test.sh
 ```
 
-Builds both images and runs their offline self-checks: the config renders and is
-accepted by the pinned Xray with WARP on *and* off, the `xray x25519` parser
+Builds the server image and runs its offline self-checks: the config renders and
+is accepted by the pinned Xray with WARP on *and* off, the `xray x25519` parser
 survives all three historical output formats, every invariant that protects you
 (no empty shortId, port 25 blocked, metadata range blocked, loopback-only health
 inbound) holds, both client configs are accepted by sing-box, and malformed
@@ -572,6 +581,6 @@ never registers a WARP identity.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). Third-party binaries redistributed in the images —
-Xray-core (MPL-2.0), wgcf (MIT), sing-box (GPL-3.0-or-later) — and their
-obligations are listed in [NOTICE](NOTICE).
+MIT. See [LICENSE](LICENSE). The third-party binaries this project ships or
+fetches — Xray-core (MPL-2.0), wgcf (MIT), sing-box (GPL-3.0-or-later) — and
+their obligations are listed in [NOTICE](NOTICE).

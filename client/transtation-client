@@ -123,13 +123,13 @@ validate() {
 		done
 	fi
 
-	# Resolve once, here, so the container's resolver never has to look up the
+	# Resolve once, here, so the tunnel's own resolver never has to look up the
 	# server name mid-flight -- and so the killswitch's bootstrap rule stays
 	# valid for as long as the tunnel does.
 	case "$HOST" in
 		*[!0-9.]*)
 			_ip=$(resolve4 "$HOST") || true
-			[ -n "$_ip" ] || die "cannot resolve $(q "$HOST") from inside the container"
+			[ -n "$_ip" ] || die "cannot resolve $(q "$HOST") -- check this host's DNS, or put the server's IP in the link"
 			printf 'resolved %s -> %s\n' "$HOST" "$_ip"
 			SERVER_IP=$_ip
 			;;

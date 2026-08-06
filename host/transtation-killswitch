@@ -1,13 +1,13 @@
 #!/bin/sh
 # transtation-killswitch -- fail-closed egress filter for MODE=tun.
 #
-# Host-owned on purpose. The client container never writes host firewall state:
-# with --network host its rules would land in the host's network namespace as
-# ordinary kernel state that outlives the container, and SIGKILL / OOM / a
-# dockerd crash bypasses any cleanup trap it might install. Worse, under
-# `restart: unless-stopped` a container that applies the killswitch and then
-# fails to start would sit in a loop re-closing your network faster than you
-# can open it.
+# Separate from the client service on purpose. Firewall rules are kernel state
+# that outlives whatever created them, and SIGKILL or OOM bypasses any cleanup
+# trap the client might install -- so a service that both closes the network and
+# can die without warning is a service that can strand you. Worse, under
+# `Restart=always` one that applies the killswitch and then fails to start would
+# sit in a loop re-closing your network faster than you can open it. Turning it
+# on and off stays an explicit, separate act.
 #
 #   transtation-killswitch on [--persist]
 #   transtation-killswitch off

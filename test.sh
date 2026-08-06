@@ -1,5 +1,5 @@
 #!/bin/sh
-# transtation test suite. Builds both images and runs their offline self-checks.
+# transtation test suite. Builds the server image and runs its offline self-checks.
 #
 #   sh test.sh
 #

@@ -34,11 +34,11 @@ else
 fi
 
 echo
-echo "== the installer must never hand capabilities to the server =="
-# Adding NET_ADMIN makes Xray attempt kernel TUN, which writes to /proc/sys
-# before opening the device, hits Docker's read-only /proc/sys, and fails with
-# no fallback to userspace. This is the single easiest way to break a working
-# install, so it gets a test rather than only a comment.
+echo "== the installer must ask for no capabilities and no devices =="
+# Least privilege: the server needs no capabilities and no devices, so the
+# installer must never quietly grant any. (The generated config also pins
+# "noKernelTun": true, which makes WARP independent of capabilities -- but the
+# compose file should still ask for nothing.)
 # Scoped to the compose block the installer actually writes, with comments
 # stripped -- an earlier version of this test matched its own warning comment
 # and "failed" on a correct file.
@@ -68,19 +68,42 @@ fi
 
 echo
 echo "== build =="
-docker build -q -f server/Dockerfile -t "$SERVER_IMG" . >/dev/null && ok "server image builds"
-docker build -q -f client/Dockerfile -t "$CLIENT_IMG" . >/dev/null && ok "client image builds"
+# buildx, not the legacy builder: the Dockerfiles use --platform=$BUILDPLATFORM
+# on the fetch stage so that cross-arch CI builds do not run curl and unzip
+# under QEMU, and the legacy builder cannot parse it.
+docker buildx version >/dev/null 2>&1 || {
+	echo "  FAIL  docker buildx is required (Arch: pacman -S docker-buildx)"
+	exit 1
+}
+# A failed build must be fatal. Everything below runs `docker run`, and a
+# missing image makes those commands fail in exactly the way a *passing*
+# negative test looks like -- which is how an earlier version of this file
+# reported all green against images that did not exist.
+docker buildx build --load -f server/Dockerfile -t "$SERVER_IMG" . >/dev/null 2>&1 ||
+	{ bad "server image builds"; exit 1; }
+ok "server image builds"
+docker buildx build --load -f client/Dockerfile -t "$CLIENT_IMG" . >/dev/null 2>&1 ||
+	{ bad "client image builds"; exit 1; }
+ok "client image builds"
+docker image inspect "$SERVER_IMG" >/dev/null 2>&1 || { bad "server image exists"; exit 1; }
+docker image inspect "$CLIENT_IMG" >/dev/null 2>&1 || { bad "client image exists"; exit 1; }
 
 echo
 echo "== server selftest (offline) =="
 docker run --rm --network none "$SERVER_IMG" selftest || fail=1
 
 echo
-echo "== server image holds no capabilities and runs as a non-root user =="
-check "server image default user is not root" \
-	sh -c "test \"\$(docker run --rm --network none --entrypoint id $SERVER_IMG -u)\" != 0"
-check "server image ships no geodata (it would be dead weight)" \
-	sh -c "! docker run --rm --network none --entrypoint ls $SERVER_IMG /usr/local/share/xray 2>/dev/null | grep -q dat"
+echo "== server image runs unprivileged and carries no dead weight =="
+image_user_nonroot() {
+	_u=$(docker run --rm --network none --entrypoint id "$SERVER_IMG" -u) || return 1
+	[ -n "$_u" ] && [ "$_u" != 0 ]
+}
+no_geodata() {
+	_l=$(docker run --rm --network none --entrypoint ls "$SERVER_IMG" -1 /usr/local/share/xray 2>&1) || return 0
+	case "$_l" in *.dat*) return 1 ;; *) return 0 ;; esac
+}
+check "server image default user is not root" image_user_nonroot
+check "server image ships no geoip/geosite data" no_geodata
 
 echo
 echo "== client config renders and sing-box accepts it =="
@@ -91,7 +114,12 @@ docker run --rm --network none \
 
 echo
 echo "== client rejects malformed links at the trust boundary =="
-rejects() { ! docker run --rm --network none -e TT_URI="$1" "$CLIENT_IMG" check >/dev/null 2>&1; }
+# Not just "the command failed" -- it must have failed with OUR validation
+# error. Otherwise a broken image passes every one of these.
+rejects() {
+	_out=$(docker run --rm --network none -e TT_URI="$1" "$CLIENT_IMG" check 2>&1) && return 1
+	case "$_out" in *transtation-client:*) return 0 ;; *) return 1 ;; esac
+}
 check "rejects a non-vless scheme" rejects 'https://example.com'
 check "rejects a bad uuid" rejects 'vless://not-a-uuid@203.0.113.10:443?pbk=6ZP9LtQm3vXk8sT2wYnBcRfJhGdA1uEoI0pZxCyN4Vs&sid=1c69b566b0480c74&sni=a.com'
 check "rejects a short pbk" rejects 'vless://8f3e21c4-7a09-4b2e-9d51-6c0f1a2b3c4d@203.0.113.10:443?pbk=tooshort&sid=1c69b566b0480c74&sni=a.com'

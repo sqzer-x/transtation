@@ -11,22 +11,43 @@ healthy. The server starts clean, the port listens, and every rejected
 connection falls through to the genuine site your server impersonates, so a
 browser pointed at your server shows you `www.microsoft.com`.
 
-It means the handshake was rejected before Xray logged anything. Causes, in
-order of likelihood:
+First, settle it in one command:
 
-1. **Wrong `pbk`, `sid` or `sni` in the link.** Regenerate it — never hand-edit
+```
+transtation verify
+```
+
+That does a real REALITY handshake against the server's own inbound. If it
+fails, the problem is the server, not your client — and note that the
+healthcheck cannot tell you this, because it goes through a loopback inbound
+that never touches REALITY.
+
+Causes, in order of likelihood:
+
+1. **The dest's certificate chain is too big.** Above roughly 5200 bytes the
+   handshake dies partway through the borrowed certificate. `www.microsoft.com`
+   (5879 bytes) is the notable trap — it looks like the safest possible choice
+   and does not work. Check and replace:
+   ```
+   docker compose exec proxy xray tls ping www.microsoft.com   # look at the chain length
+   echo 'SNI=dl.google.com' >> /opt/transtation/.env
+   cd /opt/transtation && docker compose up -d && transtation verify
+   ```
+   Known-good: `dl.google.com` (895), `www.cloudflare.com` (2493),
+   `addons.mozilla.org` (2843), `www.nicovideo.jp` (3822).
+2. **Wrong `pbk`, `sid` or `sni` in the link.** Regenerate it — never hand-edit
    it, and never reuse a link from an older install:
    ```
    transtation show
    ```
-2. **`minClientVer`.** Newer Xray versions default the Reality server to a
+3. **`minClientVer`.** Newer Xray versions default the Reality server to a
    client-version floor, and a client below it gets exactly this behaviour.
    transtation pins `minClientVer=0.0.0` so this cannot happen; if you set
    `MIN_CLIENT_VER` yourself, unset it.
-3. **Missing `fp` in a hand-built link.** sing-box, NekoBox and Hiddify hard-fail
+4. **Missing `fp` in a hand-built link.** sing-box, NekoBox and Hiddify hard-fail
    with `uTLS is required by reality client`; Xray-based clients tolerate it.
    The generated link always carries `fp=chrome`.
-4. **Your SNI stopped supporting TLS 1.3 or X25519.** Check it and pick another:
+5. **Your SNI stopped supporting TLS 1.3 or X25519.** Check it and pick another:
    ```
    docker compose exec proxy xray tls ping www.microsoft.com
    ```
@@ -59,13 +80,15 @@ TCP and succeeds; the data plane is UDP and never comes up.
 docker compose logs proxy | grep -o 'Using .* TUN'
 ```
 
-- prints `Using gVisor TUN` → good, the userspace path is live; the problem is
-  UDP egress. Set `WARP=0` in `.env` and `docker compose up -d`.
-- prints `Using kernel TUN`, or the container dies with a `read-only file
-  system` error mentioning `rp_filter` → **you added `--cap-add NET_ADMIN`.
-  Remove it.** With that capability Xray tries kernel TUN, writes to
-  `/proc/sys` before opening the device, hits Docker's read-only `/proc/sys`,
-  and fails with no fallback.
+It should print `Using gVisor TUN. NoKernelTun is set to true.` — that is the
+normal, expected path and it holds even if the container was given extra
+capabilities. So if you see it, the WireGuard stack is fine and the problem is
+UDP egress: set `WARP=0` in `.env` and `docker compose up -d`.
+
+If instead it prints `Using kernel TUN`, or the container dies with a
+`read-only file system` error mentioning `rp_filter`, then something removed
+the `noKernelTun` pin from the generated config. That is a transtation bug —
+please report it.
 
 Docker does not restart unhealthy containers by itself. `unhealthy` is a report,
 not a self-heal.

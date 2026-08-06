@@ -161,6 +161,20 @@ install_server() {
 		exit 1
 	fi
 
+	# The healthcheck proves egress, but it goes through a loopback inbound and
+	# never touches REALITY -- so a dest whose certificate chain is too large
+	# produces a permanently "healthy" server that no client can connect to.
+	# This is the only check that catches it.
+	printf '  %-14s' verify
+	if transtation verify; then :; else
+		say ""
+		say "  The server is running but clients cannot complete the REALITY handshake."
+		say "  Fix the dest and try again:"
+		say "      echo 'SNI=dl.google.com' >> $DIR/.env"
+		say "      cd $DIR && docker compose up -d && transtation verify"
+		exit 1
+	fi
+
 	say ""
 	transtation status || true
 	_port=$(sed -n 's/^PORT=//p' "$DIR/.env" 2>/dev/null | tail -1)

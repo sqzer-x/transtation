@@ -236,7 +236,7 @@ what you want to change; every value is read fresh on each boot.
 |---|---|---|
 | `PORT` | `443` | public port |
 | `HOST` | auto-detected | address that goes into the share link |
-| `SNI` | `www.microsoft.com` | the site your server impersonates |
+| `SNI` | `dl.google.com` | the site your server impersonates |
 | `DEST` | `$SNI:443` | where the handshake is forwarded |
 | `WARP` | `1` | `0` to egress from the VPS IP instead |
 | `WARP_ENDPOINT` | `162.159.192.1:2408` | override if this anycast address does not handshake |
@@ -244,34 +244,64 @@ what you want to change; every value is read fresh on each boot.
 | `MIN_CLIENT_VER` | `0.0.0` | Reality client version floor |
 | `SKIP_DEST_CHECK` | `0` | skip the startup TLS probe of `$SNI` |
 
-**Choosing an SNI matters more than anything else here.** Pick a high-reputation
-site that speaks TLS 1.3 + X25519 + HTTP/2, is plausibly popular where your
-server lives, and ideally sits in the same cloud or ASN. A Tokyo VPS borrowing a
-Japanese site's handshake looks ordinary; borrowing a Brazilian bank's does not.
-Check a candidate before committing:
+**Choosing an SNI matters more than anything else here**, for two independent
+reasons.
+
+*Camouflage.* Pick a high-reputation site that speaks TLS 1.3 + X25519, is
+plausibly popular where your server lives, and ideally sits in the same cloud or
+ASN. A Tokyo VPS borrowing a Japanese site's handshake looks ordinary; borrowing
+a Brazilian bank's does not. Apple and iCloud domains are rejected outright —
+Xray itself warns that they get your IP blocked by the GFW.
+
+*Certificate size.* **Above roughly 5200 bytes of certificate chain the REALITY
+handshake does not complete**, and the failure is silent in the worst way: the
+container reports healthy, the port listens, and every client is quietly handed
+the real website instead of your proxy. Measured end to end against Xray
+26.3.27:
+
+| dest | chain | | dest | chain |
+|---|---|---|---|---|
+| `dl.google.com` | 895 ✓ | | `www.ibm.com` | 4331 ✓ |
+| `one.one.one.one` | 2307 ✓ | | `www.paypal.com` | 4883 ✓ |
+| `www.cloudflare.com` | 2493 ✓ | | `www.linkedin.com` | 5046 ✓ |
+| `addons.mozilla.org` | 2843 ✓ | | `www.microsoft.com` | 5879 ✗ |
+| `www.nicovideo.jp` | 3822 ✓ | | | |
+
+transtation warns at startup when the chain is too big, and
+
+```
+transtation verify
+```
+
+does a genuine REALITY handshake against the server's own inbound. It is the
+only check that proves clients can actually connect — the healthcheck goes
+through a loopback inbound and never touches REALITY at all. Run it after
+changing `SNI`. `install.sh` runs it for you and refuses to finish if it fails.
+
+To inspect a candidate yourself:
 
 ```
 docker compose exec proxy xray tls ping example.com
 ```
 
-Apple and iCloud domains are rejected outright — Xray itself warns that they get
-your IP blocked by the GFW.
-
 ---
 
-## Capabilities: do not add any
-
-This is the single easiest way to break a working install, so it gets its own
-section.
+## Capabilities: none, and none needed
 
 | | Needed? | |
 |---|---|---|
-| `cap_add: NET_ADMIN` | **no — actively harmful** | Xray probes for `CAP_NET_ADMIN` up front and takes kernel TUN when it finds it. `createKernelTun` writes to `/proc/sys/.../rp_filter` *before* opening the device, Docker mounts `/proc/sys` read-only, and there is no fallback to userspace. WARP dies. |
-| `--device /dev/net/tun` | no | the gVisor network stack runs in-process |
-| `CAP_NET_BIND_SERVICE` | no | it listens on 8443 inside; `-p 443:8443` does the privileged bind in dockerd |
+| `cap_add: NET_ADMIN` | no | the generated config pins `"noKernelTun": true`, so WARP always runs in Xray's in-process userspace stack regardless of what the container holds. Adding the capability buys nothing and widens the container's privileges. |
+| `--device /dev/net/tun` | no | the userspace network stack needs no TUN device |
+| `CAP_NET_BIND_SERVICE` | no | it listens on 8443 inside; `-p 443:8443` does the privileged bind in dockerd, which also keeps this working under rootless Docker |
 | `--network host` | no, and must not be used | it would expose the loopback SOCKS inbound the healthcheck uses, turning your server into an open relay |
 
-To confirm the good path is live:
+That `noKernelTun` pin is load-bearing rather than decorative. Left unset, Xray
+probes for `CAP_NET_ADMIN` and takes the kernel-TUN path when it finds it — and
+`createKernelTun` writes to `/proc/sys/.../rp_filter` *before* opening the
+device, which fails on Docker's read-only `/proc/sys` with no fallback. Pinning
+it makes the container's behaviour independent of its capabilities.
+
+To confirm:
 
 ```
 docker compose logs proxy | grep -o 'Using .* TUN'    # -> Using gVisor TUN

@@ -256,12 +256,18 @@ write_config() {
 	_t=$(mktemp "$DATA/.config.XXXXXX")
 	render_config >"$_t"
 	jq -e . "$_t" >/dev/null 2>&1 || { rm -f "$_t"; die "generated config is not valid JSON -- this is a transtation bug"; }
-	xray run -test -c "$_t" >/dev/null 2>&1 || {
-		xray run -test -c "$_t" >&2 || true
+	# -format json is required, not optional: xray infers the format from the
+	# file extension, and this is a mktemp name with no .json suffix. Without it
+	# every validation fails with "Failed to get format of ..." and the server
+	# never starts.
+	xray run -test -format json -c "$_t" >/dev/null 2>&1 || {
+		xray run -test -format json -c "$_t" >&2 || true
 		rm -f "$_t"
 		die "generated config was rejected by xray -- this is a transtation bug"
 	}
-	chmod 644 "$_t"
+	# 0600: this file inlines the REALITY private key and the WireGuard private
+	# key. Xray runs as the same uid that owns it, so it needs nothing wider.
+	chmod 600 "$_t"
 	mv -f "$_t" "$CONF"
 }
 
@@ -289,7 +295,13 @@ apply() {
 	load_runtime
 	write_config
 	if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = xray ]; then
-		echo "restarting xray to apply (existing connections drop; clients reconnect automatically)"
+		# Xray has no reload signal and no config watcher, so the file is the
+		# source of truth and the only way to apply it is to restart. Stopping
+		# PID 1 stops the container; Docker's restart policy brings it back.
+		echo "applying: stopping xray so your restart policy brings it back up."
+		echo "  existing connections drop and clients reconnect on their own."
+		echo "  If you started this container WITHOUT a restart policy, start it again:"
+		echo "    docker start \$(hostname)"
 		kill -TERM 1
 	else
 		echo "written; takes effect the next time the container starts"
@@ -336,6 +348,91 @@ cmd_show() {
 	printf '  This link was NOT written to the container log.\n\n'
 }
 
+# -------------------------------------------------------------- dest checks
+
+# A dest whose TLS certificate chain is too large silently breaks REALITY: the
+# handshake authenticates correctly and then dies partway through the borrowed
+# certificate, so the server looks perfectly healthy while no client can
+# connect. Measured against Xray 26.3.27, end to end:
+#
+#   dl.google.com        895   works        www.ibm.com      4331  works
+#   one.one.one.one     2307   works        www.paypal.com   4883  works
+#   www.cloudflare.com  2493   works        www.linkedin.com 5046  works
+#   addons.mozilla.org  2843   works        www.microsoft.com 5879 FAILS
+#   www.nicovideo.jp    3822   works
+#
+# The boundary sits between 5046 and 5879, so the warning fires above 5200.
+CHAIN_LIMIT=5200
+
+check_dest() {
+	_ping=$(xray tls ping "$SNI" 2>&1) || true
+	case "$_ping" in
+		*"Handshake succeeded"*) ;;
+		*)
+			warn "TLS probe to $SNI failed from this host. Starting anyway, but clients
+    may fail the Reality handshake. Investigate with: xray tls ping $SNI"
+			return 0
+			;;
+	esac
+	_chain=$(printf '%s' "$_ping" | sed -n "s/^Certificate chain's total length: *\([0-9][0-9]*\).*/\1/p" | head -1)
+	[ -n "$_chain" ] || return 0
+	if [ "$_chain" -gt "$CHAIN_LIMIT" ]; then
+		warn "$SNI presents a $_chain-byte certificate chain. Above roughly $CHAIN_LIMIT bytes the
+    REALITY handshake does not complete, and the failure is SILENT: this server
+    will look healthy and no client will be able to connect.
+    Pick a smaller target -- dl.google.com (895), www.cloudflare.com (2493) and
+    addons.mozilla.org (2843) all have plenty of headroom.
+    Confirm either way with:  transtation verify"
+	fi
+}
+
+# The only check that exercises the actual REALITY path. The healthcheck cannot:
+# it goes through the loopback SOCKS inbound and never touches REALITY at all,
+# so a broken dest passes it forever.
+cmd_verify() {
+	# shellcheck source=/dev/null
+	. "$STATE"
+	load_runtime
+	[ -s "$USERS" ] || die "no users"
+	_u=$(head -1 "$USERS" | cut -f2)
+	_s=$(head -1 "$USERS" | cut -f3)
+	_d=$(mktemp -d)
+	cat >"$_d/c.json" <<-EOF
+		{
+		  "log": { "loglevel": "none" },
+		  "inbounds": [{ "listen": "127.0.0.1", "port": 10809, "protocol": "socks",
+		                 "settings": { "auth": "noauth", "udp": false } }],
+		  "outbounds": [{
+		    "protocol": "vless",
+		    "settings": { "vnext": [{ "address": "127.0.0.1", "port": $INTERNAL_PORT,
+		      "users": [{ "id": "$_u", "encryption": "none", "flow": "xtls-rprx-vision" }] }] },
+		    "streamSettings": { "network": "tcp", "security": "reality",
+		      "realitySettings": { "fingerprint": "chrome", "serverName": "$SNI",
+		        "publicKey": "$REALITY_PUB", "shortId": "$_s", "spiderX": "/" } }
+		  }]
+		}
+	EOF
+	xray run -format json -c "$_d/c.json" >/dev/null 2>&1 &
+	_pid=$!
+	sleep 2
+	_out=$(curl -fsS --max-time 20 --socks5-hostname 127.0.0.1:10809 https://cloudflare.com/cdn-cgi/trace 2>/dev/null) || true
+	kill "$_pid" 2>/dev/null || true
+	rm -rf "$_d"
+
+	if [ -z "$_out" ]; then
+		die "REALITY handshake FAILED against this server's own inbound.
+    Clients will not be able to connect, however healthy the container looks.
+    The usual cause is the dest: $SNI
+    Check its certificate chain -- above roughly $CHAIN_LIMIT bytes REALITY cannot
+    complete the handshake:
+        xray tls ping $SNI
+    Then pick a smaller one (dl.google.com, www.cloudflare.com, addons.mozilla.org),
+    set SNI= in your .env, and 'docker compose up -d'."
+	fi
+	printf 'REALITY handshake OK. Egress through the tunnel: %s\n' \
+		"$(echo "$_out" | grep -E '^(ip|colo|warp)=' | tr '\n' ' ')"
+}
+
 # ------------------------------------------------------------------- health
 
 trace() { curl -fsS --max-time 8 --socks5-hostname "$HEALTH_ADDR:$HEALTH_PORT" https://cloudflare.com/cdn-cgi/trace; }
@@ -349,8 +446,9 @@ cmd_health() {
 				Reality is up, but the WARP tunnel is not passing traffic.
 				  - some VPS providers block outbound UDP/2408 (registration is TCP, so it
 				    succeeded anyway and this only shows up now)
-				  - if you added --cap-add NET_ADMIN, REMOVE it. It makes Xray try kernel TUN,
-				    which fails on Docker's read-only /proc/sys with no fallback to userspace.
+				  - the WireGuard stack itself is fine: this image pins "noKernelTun": true, so
+				    it always uses Xray's in-process userspace stack no matter what
+				    capabilities the container holds.
 				  fix: set WARP=0 in your .env and run 'docker compose up -d'. The proxy works
 				       without WARP; it just egresses from this VPS's own IP.
 			EOF
@@ -479,6 +577,13 @@ cmd_selftest() {
 		_jq '[.routing.rules[] | select(.outboundTag == "block") | .ip // []] | flatten | index("169.254.0.0/16")'
 	_assert "logs go to stdout, not an unrotated file" _jq '.log.error == ""'
 	_assert "health SOCKS inbound is loopback-only" _jq '.inbounds[1].listen == "127.0.0.1"'
+	# config.json inlines the REALITY private key and the WireGuard private key.
+	# It was 0644 once, copied out of habit from a setup where xray ran as a
+	# different user than the file's owner. Here it does not.
+	_perm600() { [ "$(stat -c %a "$1" 2>/dev/null)" = 600 ]; }
+	_assert "config.json is 0600 (it inlines both private keys)" _perm600 "$CONF"
+	_assert "state.env is 0600" _perm600 "$STATE"
+	_assert "users.tsv is 0600" _perm600 "$USERS"
 	_assert "two users produce two clients and two shortIds" \
 		_jq '(.inbounds[0].settings.clients | length) == 2 and (.inbounds[0].streamSettings.realitySettings.shortIds | length) == 2'
 
@@ -537,7 +642,7 @@ cmd_run() {
 	migrate
 
 	# --- config: read from the environment every boot, never persisted ---
-	SNI=${SNI:-www.microsoft.com}
+	SNI=${SNI:-dl.google.com}
 	# Validated before anything else touches it: SNI reaches a JSON document and
 	# an unvalidated value sourced from a file would be a shell injection.
 	printf '%s' "$SNI" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$' ||
@@ -558,11 +663,7 @@ cmd_run() {
 		"could not auto-detect this host's public address.
     Set HOST=<your.ip.or.domain> in your .env and start again."
 
-	if [ "${SKIP_DEST_CHECK:-0}" != 1 ]; then
-		xray tls ping "$SNI" >/dev/null 2>&1 ||
-			warn "TLS probe to $SNI failed from this host. Starting anyway, but clients may
-    fail the Reality handshake. Verify with: xray tls ping $SNI"
-	fi
+	[ "${SKIP_DEST_CHECK:-0}" = 1 ] || check_dest
 
 	# --- first user: gated on users.tsv, not on state.env ---------------
 	# This separation is the whole point. If provisioning is interrupted between
@@ -593,6 +694,8 @@ usage() {
 		  show [name]            print the share link and QR for a user, or for all users
 		  status                 server address, SNI, egress IP, users, WARP state
 		  health                 exit 0 if traffic (and WARP, if enabled) is getting out
+		  verify                 do a real REALITY handshake against this server -- the
+		                         only check that proves clients can actually connect
 		  user add <name>        create a user with a fresh UUID and shortId, then apply
 		  user rm <name>         revoke a user, then apply
 		  user ls                list users
@@ -608,6 +711,7 @@ case "${1:-run}" in
 	show) shift; cmd_show "${1:-}" ;;
 	status) cmd_status ;;
 	health) cmd_health ;;
+	verify) cmd_verify ;;
 	backup) cmd_backup ;;
 	reset) cmd_reset ;;
 	selftest) cmd_selftest ;;

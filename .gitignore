@@ -4,3 +4,6 @@
 
 # Backups produced by `transtation backup` — these DO contain private keys.
 *.tgz
+
+# Working notes. Not part of the distribution.
+.notes/

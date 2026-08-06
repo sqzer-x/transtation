@@ -131,17 +131,29 @@ warp_ready() { warp_wanted && [ -f "$PROFILE" ]; }
 warp_register() {
 	# ONE attempt. Never a retry loop: hammering Cloudflare's registration
 	# endpoint is how a source IP -- historically a whole region -- gets blocked.
-	if wgcf register --accept-tos --config "$ACCOUNT" >/dev/null 2>&1 &&
-		wgcf generate --config "$ACCOUNT" --profile "$PROFILE" >/dev/null 2>&1; then
-		chmod 600 "$ACCOUNT" "$PROFILE"
+	#
+	# Registers into temporary files and promotes them only on success. An
+	# earlier version deleted the live profile first, so a rate-limited retry --
+	# the single most likely outcome of running this by hand -- destroyed a
+	# working WARP identity and silently degraded the server to direct egress on
+	# its next restart.
+	_ta="$DATA/.acct.$$"
+	_tp="$DATA/.prof.$$"
+	rm -f "$_ta" "$_tp"
+	if wgcf register --accept-tos --config "$_ta" >/dev/null 2>&1 &&
+		wgcf generate --config "$_ta" --profile "$_tp" >/dev/null 2>&1; then
+		chmod 600 "$_ta" "$_tp"
+		mv -f "$_ta" "$ACCOUNT"
+		mv -f "$_tp" "$PROFILE"
 		return 0
 	fi
-	rm -f "$PROFILE"
+	rm -f "$_ta" "$_tp"
 	warn "Cloudflare WARP registration failed (rate limit, or the API changed).
     Cloudflare rate-limits registration per source IP for roughly 15 minutes.
     Continuing with DIRECT egress from this VPS's own IP -- the proxy works.
       retry:            transtation warp register
-      turn off for good: set WARP=0 in your .env and 'docker compose up -d'"
+      turn off for good: set WARP=0 in your .env and 'docker compose up -d'
+    Any WARP identity you already had is untouched."
 	return 1
 }
 
@@ -1080,7 +1092,8 @@ case "${1:-run}" in
 		shift
 		case "${1:-}" in
 			register)
-				rm -f "$PROFILE"
+				# No pre-emptive delete: warp_register promotes its result only on
+				# success, so a failed retry leaves a working identity in place.
 				warp_register && { echo "WARP registered."; apply; }
 				;;
 			*) die "unknown: warp ${1:-}" ;;

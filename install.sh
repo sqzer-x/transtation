@@ -341,16 +341,36 @@ install_client() {
 			"$(client_image)" >/dev/null
 	fi
 
-	sleep 4
 	printf '  %-14s' self-test
-	if [ "$_tun" = 1 ]; then
-		curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
-			grep -E '^(ip|warp|colo)=' | tr '\n' ' ' || printf 'no answer yet'
+	# The result has to be captured and tested. An earlier version piped curl
+	# into grep into tr with `|| printf "no answer yet"` on the end -- which hangs
+	# off `tr`, the last command in the pipeline, and `tr` always succeeds. The
+	# fallback could never fire, so a client that was not passing any traffic at
+	# all still finished with a success banner.
+	_probe=""
+	_n=0
+	while [ "$_n" -lt 6 ]; do
+		if [ "$_tun" = 1 ]; then
+			_probe=$(curl -fsS --max-time 10 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
+				grep -E '^(ip|warp|colo)=' | tr '\n' ' ')
+		else
+			_probe=$(curl -fsS --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
+				grep -E '^(ip|warp|colo)=' | tr '\n' ' ')
+		fi
+		[ -n "$_probe" ] && break
+		_n=$((_n + 1))
+		sleep 2
+	done
+	if [ -n "$_probe" ]; then
+		say "$_probe"
 	else
-		curl -fsS --max-time 10 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null |
-			grep -E '^(ip|warp|colo)=' | tr '\n' ' ' || printf 'no answer yet -- check: docker logs transtation-client'
+		say "NO TRAFFIC"
+		say ""
+		say "  The client started but nothing is getting through. Look at:"
+		say "      docker logs transtation-client"
+		[ "$_tun" = 1 ] && say "      sudo transtation-panic     # to undo the tunnel and killswitch"
+		exit 1
 	fi
-	say ""
 
 	if [ "$_tun" = 0 ]; then
 		cat <<-'EOF'

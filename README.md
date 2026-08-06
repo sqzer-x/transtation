@@ -4,8 +4,8 @@ Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
 container on any Linux box that has Docker.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.10/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.10 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.11/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.11 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -45,7 +45,7 @@ transtation exists because of a narrower set of preferences:
 Two-step form above is the recommended one. If you are going to pipe it anyway:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.10/install.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.11/install.sh | sudo sh
 ```
 
 The installer needs root, refuses anything other than x86_64/aarch64, installs
@@ -59,7 +59,7 @@ If you already run Docker and prefer to do it yourself:
 # /opt/transtation/docker-compose.yml
 services:
   proxy:
-    image: ghcr.io/sqzer-x/transtation:v1.0.10
+    image: ghcr.io/sqzer-x/transtation:v1.0.11
     container_name: transtation
     restart: unless-stopped
     ports: ["443:8443"]
@@ -121,6 +121,13 @@ anything.
 
 ### Proxy mode (default) — a local SOCKS5 + HTTP proxy
 
+**This does not put your machine behind the proxy.** It opens a proxy on
+`127.0.0.1:1080` and nothing else. Every program that should use it has to be
+pointed at it, one at a time. Your browser keeps using your own address until
+you configure it; so does everything started from your desktop, and every
+systemd service. If what you want is "all of this machine's traffic", that is
+[tun mode](#tun-mode--the-whole-host), not this.
+
 ```
 sudo sh install.sh client
 ```
@@ -132,7 +139,7 @@ install -Dm600 /dev/stdin /etc/transtation/uri   # paste the vless:// link, then
 docker run -d --name transtation-client --restart unless-stopped \
   -p 127.0.0.1:1080:1080 \
   -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.10
+  ghcr.io/sqzer-x/transtation-client:v1.0.11
 ```
 
 ```
@@ -140,9 +147,21 @@ export ALL_PROXY=socks5h://127.0.0.1:1080
 export HTTPS_PROXY=http://127.0.0.1:1080 HTTP_PROXY=http://127.0.0.1:1080
 ```
 
+Those two lines apply to **that shell and the programs it starts**, and nothing
+else. Measured on a host with the client running:
+
+```
+curl https://api.ipify.org                 198.51.100.23   your own address
+curl https://api.ipify.org   (after the exports)
+                                           192.0.2.7    through the proxy
+env -i curl https://api.ipify.org          198.51.100.23   your own address
+   … and the same from any other terminal, and from anything your desktop starts
+```
+
 The **`h`** in `socks5h` is load-bearing: plain `socks5://` makes curl resolve
-DNS locally and leaks every hostname you visit. In Firefox, tick "Proxy DNS when
-using SOCKS v5".
+DNS locally and leaks every hostname you visit. In Firefox, set the SOCKS host
+in the connection settings and tick "Proxy DNS when using SOCKS v5" — the
+environment variables above will not reach it.
 
 No capabilities, no devices, no host networking, so nothing here needs a
 rootful container runtime — it was run under rootless Podman as well as Docker.
@@ -157,12 +176,20 @@ Client-side settings, all optional:
 | `TT_URI_FILE` | `/etc/transtation/uri` | where the share link is read from |
 | `TT_URI` | *(unset)* | the link inline — visible in `docker inspect`, so prefer the file |
 
-**Not covered:** QUIC (browsers do not send UDP over SOCKS, so it silently falls
-back to TCP), and any application that ignores proxy environment variables.
+Two more things this mode will not do even for a program you *have* pointed at
+it: QUIC (browsers do not send UDP over SOCKS, so it silently falls back to
+TCP), and anything that reads no proxy setting at all.
+
 **No killswitch is needed here** — nothing is redirected, so if the container
-dies, proxied connections simply fail. That is this mode's biggest advantage.
+dies, proxied connections simply fail and everything else was never going
+through it in the first place. That is this mode's biggest advantage and its
+biggest limitation, and they are the same sentence.
 
 ### Tun mode — the whole host
+<a id="tun-mode--the-whole-host"></a>
+
+This is the one that captures everything the machine sends, with no per-program
+configuration.
 
 ```
 sudo sh install.sh client --tun --killswitch
@@ -176,7 +203,7 @@ docker run -d --name transtation-client --restart unless-stopped \
   -e MODE=tun \
   -e DIRECT_SUFFIXES=example.com,example.net \
   -v /etc/transtation:/etc/transtation:ro \
-  ghcr.io/sqzer-x/transtation-client:v1.0.10
+  ghcr.io/sqzer-x/transtation-client:v1.0.11
 ```
 
 Exactly three extra flags. `--privileged` is **not** needed and must not be

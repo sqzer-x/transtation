@@ -15,12 +15,12 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.10}
+VERSION=${TT_VERSION:-v1.0.11}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.10, and the hash-verified installer you read would vouch for nothing.
+# v1.0.11, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 
@@ -353,7 +353,7 @@ install_client() {
 			/usr/local/sbin/transtation-killswitch on
 		fi
 	else
-		step mode "proxy -- local SOCKS5 + HTTP, no root privileges used at runtime"
+		step mode "proxy -- local SOCKS5 + HTTP on 127.0.0.1:1080"
 		docker run -d --name transtation-client --restart unless-stopped \
 			-p 127.0.0.1:1080:1080 \
 			-v "$URI_DIR":"$URI_DIR":ro \
@@ -381,7 +381,7 @@ install_client() {
 		sleep 2
 	done
 	if [ -n "$_probe" ]; then
-		say "$_probe"
+		[ "$_tun" = 1 ] && say "$_probe" || say "through the proxy: $_probe"
 	else
 		say "NO TRAFFIC"
 		say ""
@@ -394,13 +394,19 @@ install_client() {
 	if [ "$_tun" = 0 ]; then
 		cat <<-'EOF'
 
+			  THIS DOES NOT PUT YOUR MACHINE BEHIND THE PROXY. It opens a proxy and
+			  nothing else; each program has to be pointed at it. Your browser and
+			  anything your desktop starts keep using your own address until you
+			  configure them. For "all of this machine's traffic", use --tun instead.
+
 			  export ALL_PROXY=socks5h://127.0.0.1:1080 HTTPS_PROXY=http://127.0.0.1:1080 HTTP_PROXY=http://127.0.0.1:1080
 
+			    Those apply to that shell and what it starts, and nothing else.
 			    The "h" in socks5h is load-bearing: plain socks5:// makes curl resolve DNS
-			    locally and leaks every hostname you visit. In Firefox, tick "Proxy DNS
-			    when using SOCKS v5".
-			    Not covered by this mode: QUIC (it degrades to TCP) and any app that
-			    ignores proxy environment variables.
+			    locally and leaks every hostname you visit. Firefox needs its own
+			    connection settings; it does not read these variables.
+			    Not covered even for a program you did point at it: QUIC (it degrades to
+			    TCP) and anything that reads no proxy setting at all.
 
 			  Whole-system tunnel instead:  sudo sh install.sh client --tun --killswitch
 

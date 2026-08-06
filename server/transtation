@@ -16,9 +16,26 @@ HEALTH_PORT=10808
 WARP_PEER_PUBKEY='bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo='
 WARP_ENDPOINT_DEFAULT='162.159.192.1:2408'
 TAB=$(printf '\t')
+# How this instance is supervised. The image sets TT_MANAGED=docker; a native
+# install leaves it unset and is managed by systemd. It decides how the server
+# is restarted and which file the operator edits -- and, critically, that
+# `kill -TERM 1` is only ever right inside a container. On a host, PID 1 is
+# init.
+TT_MANAGED=${TT_MANAGED:-systemd}
+restart_hint() { [ "$TT_MANAGED" = docker ] && printf 'docker compose up -d' || printf 'systemctl restart transtation'; }
+env_hint() { [ "$TT_MANAGED" = docker ] && printf '/opt/transtation/.env' || printf '/etc/transtation/server.env'; }
 
 set_paths() {
-	DATA=${TT_DATA:-/data}
+	# The container mounts its volume at /data; a native install keeps state
+	# where a system service should. Getting this wrong sends `transtation show`
+	# looking at an empty directory.
+	if [ -n "${TT_DATA:-}" ]; then
+		DATA=$TT_DATA
+	elif [ "$TT_MANAGED" = docker ]; then
+		DATA=/data
+	else
+		DATA=/var/lib/transtation
+	fi
 	STATE="$DATA/state.env"
 	USERS="$DATA/users.tsv"
 	CONF="$DATA/config.json"
@@ -154,7 +171,7 @@ warp_register() {
     Cloudflare rate-limits registration per source IP for roughly 15 minutes.
     Continuing with DIRECT egress from this VPS's own IP -- the proxy works.
       retry:            transtation warp register
-      turn off for good: set WARP=0 in your .env and 'docker compose up -d'
+      turn off for good: set WARP=0 in $(env_hint) and '$(restart_hint)'
     Any WARP identity you already had is untouched."
 	return 1
 }
@@ -213,7 +230,7 @@ render_config() {
 		    {
 		      "tag": "reality-in",
 		      "listen": "0.0.0.0",
-		      "port": $INTERNAL_PORT,
+		      "port": ${LISTEN_PORT:-$INTERNAL_PORT},
 		      "protocol": "vless",
 		      "settings": {
 		        "clients": [
@@ -276,7 +293,9 @@ render_config() {
 write_config() {
 	_t=$(mktemp "$DATA/.config.XXXXXX")
 	render_config >"$_t"
-	jq -e . "$_t" >/dev/null 2>&1 || { rm -f "$_t"; die "generated config is not valid JSON -- this is a transtation bug"; }
+	if command -v jq >/dev/null 2>&1; then
+		jq -e . "$_t" >/dev/null 2>&1 || { rm -f "$_t"; die "generated config is not valid JSON -- this is a transtation bug"; }
+	fi
 	# -format json is required, not optional: xray infers the format from the
 	# file extension, and this is a mktemp name with no .json suffix. Without it
 	# every validation fails with "Failed to get format of ..." and the server
@@ -296,20 +315,21 @@ write_runtime() {
 	# Derived, rewritten every boot. `show`/`status`/`health` run as separate
 	# `docker exec` processes and would otherwise not see an auto-detected HOST.
 	_t=$(mktemp "$DATA/.runtime.XXXXXX")
-	printf 'HOST=%s\nPORT=%s\nSNI=%s\nDEST=%s\nWARP=%s\nWARP_READY=%s\nSNI_REASON=%s\n' \
-		"$HOST" "$PORT" "$SNI" "$DEST" "${WARP:-1}" "$(warp_ready && echo 1 || echo 0)" \
-		"${SNI_REASON:-unknown}" >"$_t"
+	printf 'HOST=%s\nPORT=%s\nLISTEN_PORT=%s\nSNI=%s\nDEST=%s\nWARP=%s\nWARP_READY=%s\nSNI_REASON=%s\n' \
+		"$HOST" "$PORT" "${LISTEN_PORT:-$INTERNAL_PORT}" "$SNI" "$DEST" "${WARP:-1}" \
+		"$(warp_ready && echo 1 || echo 0)" "${SNI_REASON:-unknown}" >"$_t"
 	chmod 600 "$_t"
 	mv -f "$_t" "$RUNTIME"
 }
 
 load_runtime() {
-	[ -f "$RUNTIME" ] || die "server has not started yet -- run 'docker compose up -d' first"
-	HOST=""; PORT=""; SNI=""; DEST=""; WARP=""; WARP_READY=""; SNI_REASON=""
+	[ -f "$RUNTIME" ] || die "server has not started yet -- run '$(restart_hint)' first"
+	HOST=""; PORT=""; LISTEN_PORT=""; SNI=""; DEST=""; WARP=""; WARP_READY=""; SNI_REASON=""
 	while IFS='=' read -r _k _v; do
 		case "$_k" in
 			HOST) HOST=$_v ;;
 			PORT) PORT=$_v ;;
+			LISTEN_PORT) LISTEN_PORT=$_v ;;
 			SNI) SNI=$_v ;;
 			DEST) DEST=$_v ;;
 			WARP) WARP=$_v ;;
@@ -349,17 +369,24 @@ apply() {
 	DEST=${_dest_env:-$SNI:443}
 	write_config
 	write_runtime
-	if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = xray ]; then
-		# Xray has no reload signal and no config watcher, so the file is the
-		# source of truth and the only way to apply it is to restart. Stopping
-		# PID 1 stops the container; Docker's restart policy brings it back.
-		echo "applying: stopping xray so your restart policy brings it back up."
+	# Xray has no reload signal and no config watcher, so the file is the source
+	# of truth and the only way to apply it is to restart.
+	if [ "$TT_MANAGED" = docker ]; then
+		if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = xray ]; then
+			echo "applying: stopping xray so your restart policy brings it back up."
+			echo "  existing connections drop and clients reconnect on their own."
+			printf '  If you started this container WITHOUT a restart policy, start it again:\n'
+			printf '    docker start %s\n' "$(hostname)"
+			kill -TERM 1
+		else
+			echo "written; takes effect the next time the container starts"
+		fi
+	elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet transtation 2>/dev/null; then
+		echo "applying: restarting transtation.service"
 		echo "  existing connections drop and clients reconnect on their own."
-		printf '  If you started this container WITHOUT a restart policy, start it again:\n'
-		printf '    docker start %s\n' "$(hostname)"
-		kill -TERM 1
+		systemctl restart transtation
 	else
-		echo "written; takes effect the next time the container starts"
+		echo "written; takes effect the next time the server starts"
 	fi
 }
 
@@ -657,7 +684,7 @@ cmd_verify() {
 		                 "settings": { "auth": "noauth", "udp": false } }],
 		  "outbounds": [{
 		    "protocol": "vless",
-		    "settings": { "vnext": [{ "address": "127.0.0.1", "port": $INTERNAL_PORT,
+		    "settings": { "vnext": [{ "address": "127.0.0.1", "port": ${LISTEN_PORT:-$INTERNAL_PORT},
 		      "users": [{ "id": "$_u", "encryption": "none", "flow": "xtls-rprx-vision" }] }] },
 		    "streamSettings": { "network": "tcp", "security": "reality",
 		      "realitySettings": { "fingerprint": "chrome", "serverName": "$SNI",
@@ -694,7 +721,7 @@ cmd_verify() {
     complete the handshake:
         xray tls ping $SNI
     Then pick a smaller one (dl.google.com, www.cloudflare.com, addons.mozilla.org),
-    set SNI= in your .env, and 'docker compose up -d'."
+    set SNI= in $(env_hint), and '$(restart_hint)'."
 	fi
 	printf 'REALITY handshake OK. Egress through the tunnel: %s\n' \
 		"$(echo "$_out" | grep -E '^(ip|colo|warp)=' | tr '\n' ' ')"
@@ -716,7 +743,7 @@ cmd_health() {
 				  - the WireGuard stack itself is fine: this image pins "noKernelTun": true, so
 				    it always uses Xray's in-process userspace stack no matter what
 				    capabilities the container holds.
-				  fix: set WARP=0 in your .env and run 'docker compose up -d'. The proxy works
+				  fix: set WARP=0 in $(env_hint) and run '$(restart_hint)'. The proxy works
 				       without WARP; it just egresses from this VPS's own IP.
 			EOF
 			exit 1
@@ -743,10 +770,16 @@ cmd_status() {
 		printf '  egress        UNREACHABLE -- no traffic is getting out through the proxy\n'
 	fi
 
-	if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = xray ]; then
-		printf '  xray          running\n'
+	if [ "$TT_MANAGED" = docker ]; then
+		if [ -r /proc/1/comm ] && [ "$(cat /proc/1/comm)" = xray ]; then
+			printf '  xray          running\n'
+		else
+			printf '  xray          NOT running as PID 1 of this container\n'
+		fi
+	elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet transtation 2>/dev/null; then
+		printf '  xray          running under transtation.service\n'
 	else
-		printf '  xray          NOT running as PID 1\n'
+		printf '  xray          NOT running\n'
 	fi
 	printf '  users         %s\n' "$(awk -F'\t' 'NF>=3{printf "%s%s", (n++?", ":""), $1}' "$USERS" 2>/dev/null)"
 	printf '  inbound       not verifiable from this host. If clients time out with no server\n'
@@ -772,7 +805,7 @@ cmd_reset() {
 	[ "${I_UNDERSTAND_THIS_DESTROYS_MY_KEYS:-}" = yes ] || die \
 		"refusing. This destroys your Reality keypair and every issued link.
     If you are certain:
-      docker compose run --rm -e I_UNDERSTAND_THIS_DESTROYS_MY_KEYS=yes proxy reset"
+      I_UNDERSTAND_THIS_DESTROYS_MY_KEYS=yes transtation reset"
 	rm -f "$STATE" "$USERS" "$CONF" "$RUNTIME" "$ACCOUNT" "$PROFILE" "$SNIFILE"
 	echo "identity destroyed. The next start provisions a brand new server."
 }
@@ -952,6 +985,10 @@ validate_config_env() {
 	PORT=${PORT:-443}
 	printf '%s' "$PORT" | grep -Eq '^[0-9]{1,5}$' && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] ||
 		die "PORT must be 1-65535, got: $(q "$PORT")"
+	# In a container we listen high and let dockerd perform the privileged bind,
+	# which is why the image needs no capability at all. Natively there is
+	# nothing in front of us, so we listen on the real port.
+	[ "$TT_MANAGED" = docker ] && LISTEN_PORT=$INTERNAL_PORT || LISTEN_PORT=$PORT
 	printf '%s' "${MIN_CLIENT_VER:-0.0.0}" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){0,2}$' ||
 		die "MIN_CLIENT_VER must look like 0.0.0, got: $(q "${MIN_CLIENT_VER:-}")"
 	# Deliberately IPv4:port only, never a hostname: resolving the WARP endpoint
@@ -963,7 +1000,7 @@ validate_config_env() {
 # --------------------------------------------------------------------- run
 
 banner() {
-	printf '\n  transtation -- listening on 0.0.0.0:%s inside the container\n' "$INTERNAL_PORT"
+	printf '\n  transtation -- listening on 0.0.0.0:%s\n' "${LISTEN_PORT:-$INTERNAL_PORT}"
 	printf '  server        %s:%s\n' "$HOST" "$PORT"
 	printf '  dest / SNI    %s  (%s)\n' "$SNI" "${SNI_REASON:-unknown}"
 	if [ "${WARP:-1}" = 1 ] && ! warp_ready; then
@@ -1038,7 +1075,7 @@ cmd_run() {
 	[ -s "$USERS" ] || user_add "${USER_NAME:-main}"
 
 	# --- collect the WARP registration started above ---------------------
-	[ -z "$_warp_pid" ] || wait "$_warp_pid" || true
+	[ -z "$_warp_pid" ] || wait "$_warp_pid" 2>/dev/null || true
 
 	write_config
 	write_runtime

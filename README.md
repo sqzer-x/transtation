@@ -4,8 +4,8 @@ Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
 container on any Linux box that has Docker.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.12/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.12 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.13/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.13 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -40,42 +40,57 @@ transtation exists because of a narrower set of preferences:
 
 ## Server
 
-### Install
+Two ways to run it. They are the same software with the same config; pick on
+how you feel about a container runtime on your VPS.
 
-Two-step form above is the recommended one. If you are going to pipe it anyway:
+### In a container (default)
 
 ```
-curl -fsSL https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.12/install.sh | sudo sh
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.13/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.13 release notes
+less install.sh           # please actually read it
+sudo sh install.sh
 ```
 
-The installer needs root, refuses anything other than x86_64/aarch64, installs
-Docker if it is missing, writes `/opt/transtation/{docker-compose.yml,.env}`,
-and waits for the container to report healthy. Running it again is an upgrade:
-it pulls and restarts, and never re-provisions.
+Installs Docker if it is missing, writes `/opt/transtation/{docker-compose.yml,.env}`,
+resolves the image tag to a digest and pins the compose file to it, then waits
+for the container to be healthy and proves the handshake works. Re-running it is
+how you upgrade.
 
-If you already run Docker and prefer to do it yourself:
+### Natively
 
-```yaml
-# /opt/transtation/docker-compose.yml
-services:
-  proxy:
-    image: ghcr.io/sqzer-x/transtation:v1.0.12
-    container_name: transtation
-    restart: unless-stopped
-    ports: ["443:8443"]
-    volumes: ["transtation-data:/data"]
-    env_file: .env
-    cap_drop: [ALL]
-    security_opt: ["no-new-privileges:true"]
-    read_only: true
-    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m"]
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "3" }
-volumes:
-  transtation-data:
-    name: transtation-data      # pinned; otherwise Compose prefixes it with the directory name
 ```
+sudo sh install.sh server --native
+```
+
+No container runtime. It downloads Xray and wgcf, verifies both against
+upstream checksums, installs `/usr/local/bin/transtation`, keeps state in
+`/var/lib/transtation` owned by a dedicated `transtation` user, and runs under
+`transtation.service`.
+
+### Which one
+
+Measured on the same host, same binary:
+
+| | container | native |
+|---|---|---|
+| capabilities held | **none** — `CapEff 0000000000000000` | `CAP_NET_BIND_SERVICE`, and only that |
+| root filesystem | read-only | `ProtectSystem=strict` |
+| runs as | uid 10001 | `transtation` user |
+| costs | Docker daemon, ~250 MB, `ip_forward=1`, published ports bypass `ufw` | needs systemd |
+| upgrades | pull a new digest | re-run the installer |
+
+The container needs no capability at all because dockerd performs the
+privileged bind on 443 and the container listens high; natively there is
+nothing in front, so it keeps exactly one capability and nothing else is even
+reachable. Both pin and verify the same Xray release.
+
+If you have no strong feeling, use the container: one artifact, dependencies
+verified and frozen inside it, and rollback is a digest. If you would rather not
+run a container runtime on a proxy server, the native path is not a lesser
+option — it is the same program with a systemd unit instead of a compose file.
+
+Either way `transtation` is the command:
 
 ### Day to day
 
@@ -363,25 +378,37 @@ docker compose exec proxy xray tls ping example.com
 
 ---
 
-## Capabilities: none, and none needed
+## Capabilities
+
+The container holds **none at all**, verified on a running server:
+`CapEff`, `CapPrm` and `CapBnd` all `0000000000000000`, `NoNewPrivs 1`, root
+filesystem read-only. The native install holds `CAP_NET_BIND_SERVICE` and
+nothing else, because something has to bind 443 and there is no dockerd in
+front to do it.
 
 | | Needed? | |
 |---|---|---|
 | `cap_add: NET_ADMIN` | no | the generated config pins `"noKernelTun": true`, so WARP always runs in Xray's in-process userspace stack regardless of what the container holds. Adding the capability buys nothing and widens the container's privileges. |
 | `--device /dev/net/tun` | no | the userspace network stack needs no TUN device |
-| `CAP_NET_BIND_SERVICE` | no | it listens on 8443 inside; `-p 443:8443` does the privileged bind in dockerd, which also keeps this working under rootless Docker |
+| `CAP_NET_BIND_SERVICE` | container: no | it listens on 8443 inside; `-p 443:8443` does the privileged bind in dockerd, which also keeps this working under rootless Docker |
 | `--network host` | no, and must not be used | it would expose the loopback SOCKS inbound the healthcheck uses, turning your server into an open relay |
+
+For reference, a hand-rolled native Xray unit typically holds `CAP_NET_ADMIN`
+*and* `CAP_NET_BIND_SERVICE` with a writable root filesystem. The `NET_ADMIN`
+half is only needed for kernel-TUN WARP, which this does not use.
 
 That `noKernelTun` pin is load-bearing rather than decorative. Left unset, Xray
 probes for `CAP_NET_ADMIN` and takes the kernel-TUN path when it finds it — and
 `createKernelTun` writes to `/proc/sys/.../rp_filter` *before* opening the
 device, which fails on Docker's read-only `/proc/sys` with no fallback. Pinning
-it makes the container's behaviour independent of its capabilities.
+it makes behaviour independent of capabilities.
 
-To confirm:
+To confirm:To confirm:
 
 ```
-docker compose logs proxy | grep -o 'Using .* TUN'    # -> Using gVisor TUN
+docker compose logs proxy | grep -o 'Using .* TUN'      # container
+journalctl -u transtation | grep -o 'Using .* TUN'     # native
+# both -> Using gVisor TUN
 ```
 
 ---
@@ -450,7 +477,8 @@ the unpacking container has to run as root to read it at all. `restore` also
 refuses to run while the server is up, and refuses a file that is not a
 transtation backup.
 
-Upgrades: re-run `install.sh`, or `docker compose pull && docker compose up -d`.
+Upgrades: re-run `install.sh` (with `server --native` if that is how you
+installed), or `docker compose pull && docker compose up -d`.
 Your identity lives in the volume and survives; the config is regenerated from
 the new image every boot, so schema changes come along for free.
 

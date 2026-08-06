@@ -130,6 +130,11 @@ posix_sh_ok() {
 }
 check "install.sh survives dash (Debian, Ubuntu) with no arguments" posix_sh_ok debian:stable-slim dash
 check "install.sh survives busybox ash (Alpine) with no arguments" posix_sh_ok alpine:3.23 sh
+posix_sh_native_ok() {
+	_o=$(docker run --rm -v "$PWD":/w:ro -u 65534 "$1" sh -c "cd /w && $2 install.sh server --native" 2>&1) || true
+	case "$_o" in *"needs root"*) return 0 ;; *) return 1 ;; esac
+}
+check "the native server path dispatches under dash" posix_sh_native_ok debian:stable-slim dash
 
 echo
 echo "== client renders configs the real sing-box accepts =="

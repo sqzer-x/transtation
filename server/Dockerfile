@@ -55,6 +55,7 @@ COPY NOTICE /NOTICE
 # CIDR list replaces. Any "geoip:" or "geosite:" routing rule will fail at
 # startup with file-not-found.
 
+ENV TT_MANAGED=docker
 USER xray
 VOLUME /data
 EXPOSE 8443

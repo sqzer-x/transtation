@@ -15,18 +15,20 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.12}
+VERSION=${TT_VERSION:-v1.0.13}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.12, and the hash-verified installer you read would vouch for nothing.
+# v1.0.13, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 
 # sing-box ships no checksum file, so these were computed once from the official
 # release artifacts and are reviewed as part of this repo. The -musl builds are
 # statically linked, so one binary runs on any distribution.
+XRAY_VERSION=${TT_XRAY_VERSION:-v26.3.27}
+WGCF_VERSION=${TT_WGCF_VERSION:-2.2.32}
 SINGBOX_VERSION=${TT_SINGBOX_VERSION:-1.13.16}
 SINGBOX_SHA_amd64=9ff0345fde4157a6bdab45a615668d41ccc93f6d0f361108042a48b8a49a9baa
 SINGBOX_SHA_arm64=3ea951c68f2eea10fd3ee8f8cc7794c12ccc7405afa99279a79e0b41cb183adf
@@ -121,7 +123,172 @@ wait_healthy() {
 	return 1
 }
 
-# ------------------------------------------------------------------ server
+# --- native server -------------------------------------------------------
+
+fetch_verified_xray() {
+	case "$(uname -m)" in
+		x86_64 | amd64) _xz=Xray-linux-64.zip; _wa=amd64 ;;
+		aarch64 | arm64) _xz=Xray-linux-arm64-v8a.zip; _wa=arm64 ;;
+	esac
+	_t=$(mktemp -d)
+	_b="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}"
+	curl -fsSL -o "$_t/$_xz" "$_b/$_xz" || { rm -rf "$_t"; die "could not download Xray ${XRAY_VERSION}"; }
+	curl -fsSL -o "$_t/$_xz.dgst" "$_b/$_xz.dgst" || { rm -rf "$_t"; die "could not download the Xray checksum"; }
+	_exp=$(awk '/^SHA2-256/ {print $2}' "$_t/$_xz.dgst")
+	# Same guard as the Dockerfile: an empty expectation makes sha256sum verify
+	# nothing at all.
+	printf '%s' "$_exp" | grep -Eq '^[0-9a-f]{64}$' ||
+		{ rm -rf "$_t"; die "no usable SHA2-256 line in $_xz.dgst"; }
+	( cd "$_t" && echo "$_exp  $_xz" | sha256sum -c - >/dev/null 2>&1 ) ||
+		{ rm -rf "$_t"; die "Xray checksum mismatch -- refusing to install it"; }
+	command -v unzip >/dev/null 2>&1 || install_pkg unzip
+	unzip -q -j "$_t/$_xz" xray -d "$_t"
+	install -Dm0755 "$_t/xray" /usr/local/bin/xray
+
+	_w="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}"
+	curl -fsSL -o "$_t/wgcf" "$_w/wgcf_${WGCF_VERSION}_linux_${_wa}" ||
+		{ rm -rf "$_t"; die "could not download wgcf"; }
+	curl -fsSL "$_w/checksums.txt" | grep " wgcf_${WGCF_VERSION}_linux_${_wa}\$" |
+		awk -v f="$_t/wgcf" '{print $1"  "f}' | sha256sum -c - >/dev/null 2>&1 ||
+		{ rm -rf "$_t"; die "wgcf checksum mismatch -- refusing to install it"; }
+	install -Dm0755 "$_t/wgcf" /usr/local/bin/wgcf
+	rm -rf "$_t"
+	step binaries "xray $(/usr/local/bin/xray version | head -1 | cut -d' ' -f2) and wgcf ${WGCF_VERSION}, both checksum-verified"
+}
+
+install_pkg() {
+	case "$(os_id)" in
+		alpine) apk add --no-cache "$1" >/dev/null 2>&1 ;;
+		arch | archarm | manjaro | endeavouros) pacman -S --needed --noconfirm "$1" >/dev/null 2>&1 ;;
+		*) DEBIAN_FRONTEND=noninteractive apt-get -y -qq install "$1" >/dev/null 2>&1 ||
+			dnf -y -q install "$1" >/dev/null 2>&1 || true ;;
+	esac
+}
+
+install_server_native() {
+	need_root
+	check_arch
+	say ""
+	say "  transtation $VERSION -- native install, no container runtime"
+	say "  https://github.com/sqzer-x/transtation"
+	say ""
+	step host "$(os_id) / $(uname -m) / root"
+	[ -d /run/systemd/system ] || die "the native install is managed by systemd, which is not running here.
+    Use the container install instead:  sh install.sh"
+	command -v curl >/dev/null 2>&1 || die "curl is required"
+
+	fetch_verified_xray
+	install -Dm0755 "$(server_script)" /usr/local/lib/transtation/server
+
+	id -u transtation >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin transtation 2>/dev/null ||
+		adduser -S -D -H -s /sbin/nologin transtation 2>/dev/null || true
+	install -d -o transtation -g transtation -m 0700 /var/lib/transtation
+	mkdir -p /etc/transtation
+	[ -e /etc/transtation/server.env ] || { : >/etc/transtation/server.env; chmod 600 /etc/transtation/server.env; }
+	[ -n "${PORT:-}" ] && ! grep -q '^PORT=' /etc/transtation/server.env &&
+		printf 'PORT=%s\n' "$PORT" >>/etc/transtation/server.env
+	# Every command has to run as the service user. Run as root, the script would
+	# create root-owned files in the state directory and the service -- which is
+	# not root -- would stop being able to read its own identity.
+	install -Dm0755 /dev/stdin /usr/local/bin/transtation <<-'WRAP'
+		#!/bin/sh
+		set -eu
+		if [ "$(id -un)" = transtation ]; then
+		  exec env TT_DATA=/var/lib/transtation /usr/local/lib/transtation/server "$@"
+		fi
+		[ "$(id -u)" = 0 ] || { echo "transtation: run this as root or as the transtation user" >&2; exit 1; }
+		if command -v runuser >/dev/null 2>&1; then
+		  exec runuser -u transtation -- env TT_DATA=/var/lib/transtation /usr/local/lib/transtation/server "$@"
+		fi
+		exec su -s /bin/sh transtation -c 'exec env TT_DATA=/var/lib/transtation /usr/local/lib/transtation/server "$@"' -- sh "$@"
+	WRAP
+	step config "wrote /etc/transtation/server.env, data in /var/lib/transtation"
+
+	cat >/etc/systemd/system/transtation.service <<-'EOF'
+		[Unit]
+		Description=transtation server
+		After=network-online.target
+		Wants=network-online.target
+
+		[Service]
+		Type=simple
+		User=transtation
+		Group=transtation
+		Environment=TT_DATA=/var/lib/transtation
+		EnvironmentFile=-/etc/transtation/server.env
+		ExecStart=/usr/local/lib/transtation/server run
+		Restart=on-failure
+		RestartSec=3s
+		# The container needs no capability because dockerd performs the
+		# privileged bind. Here nothing is in front of us, so we keep exactly
+		# one -- and nothing else is even reachable.
+		AmbientCapabilities=CAP_NET_BIND_SERVICE
+		CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+		NoNewPrivileges=true
+		ProtectSystem=strict
+		ProtectHome=true
+		PrivateTmp=true
+		PrivateDevices=true
+		ProtectKernelTunables=true
+		ProtectControlGroups=true
+		RestrictSUIDSGID=true
+		ReadWritePaths=/var/lib/transtation
+
+		[Install]
+		WantedBy=multi-user.target
+	EOF
+	systemctl daemon-reload
+	printf '  %-14s' start
+	systemctl enable --now transtation.service >/dev/null 2>&1 || true
+	_i=0
+	while [ "$_i" -lt 40 ]; do
+		/usr/local/bin/transtation health >/dev/null 2>&1 && break
+		_i=$((_i + 1)); printf '.'; sleep 3
+	done
+	systemctl is-active --quiet transtation || {
+		say "FAILED"
+		say "  journalctl -u transtation -n 40"
+		exit 1
+	}
+	say "running"
+
+	printf '  %-14s' verify
+	/usr/local/bin/transtation verify || {
+		say ""
+		say "  The server is running but clients cannot complete the REALITY handshake."
+		say "      echo 'SNI=dl.google.com' >> /etc/transtation/server.env"
+		say "      systemctl restart transtation && transtation verify"
+		exit 1
+	}
+	say ""
+	/usr/local/bin/transtation status || true
+	cat <<-EOF
+		  DO THIS NOW -- it is the only irreplaceable thing on this box:
+		      transtation backup
+
+		  Your link:   transtation show
+		  Add a user:  transtation user add alice
+		  Logs:        journalctl -u transtation -f
+		  Uninstall:   sh install.sh --uninstall
+
+		  >> If a client cannot connect, open the port in your provider's firewall
+		     or security group. The healthcheck only proves OUTBOUND traffic works.
+
+	EOF
+}
+
+server_script() {
+	_d=$(dirname -- "$0" 2>/dev/null || echo .)
+	if [ -r "$_d/server/transtation" ]; then
+		printf '%s' "$_d/server/transtation"
+		return 0
+	fi
+	_f=$(mktemp)
+	curl -fsSL "$RAW/server/transtation" -o "$_f" || die "could not fetch the server script from $RAW"
+	printf '%s' "$_f"
+}
+
+# ------------------------------------------------------ server (container)
 
 install_server() {
 	need_root
@@ -515,6 +682,19 @@ uninstall() {
 			*) say "volume kept: 'docker volume ls | grep transtation-data'" ;;
 		esac
 	fi
+	if [ -e /etc/systemd/system/transtation.service ]; then
+		systemctl disable --now transtation.service >/dev/null 2>&1 || true
+		rm -f /etc/systemd/system/transtation.service
+		systemctl daemon-reload 2>/dev/null || true
+		rm -rf /usr/local/bin/transtation /usr/local/lib/transtation /usr/local/bin/xray /usr/local/bin/wgcf
+		say "native server removed. Its data is still in /var/lib/transtation."
+		ask 'also delete /var/lib/transtation? That destroys your Reality key and every issued link. [y/N] '
+		say ""
+		case "$REPLY" in
+			y | Y) rm -rf /var/lib/transtation; say "data deleted." ;;
+			*) say "data kept in /var/lib/transtation" ;;
+		esac
+	fi
 	if [ -e /etc/systemd/system/transtation-client.service ]; then
 		systemctl disable --now transtation-client.service >/dev/null 2>&1 || true
 		rm -f /etc/systemd/system/transtation-client.service
@@ -535,7 +715,14 @@ main() {
 	_cmd=${1:-server}
 	if [ $# -gt 0 ]; then shift; fi
 	case "$_cmd" in
-		server) install_server ;;
+		server)
+			case "${1:-}" in
+				--native) install_server_native ;;
+				'') install_server ;;
+				*) die "unknown option: $1 (expected --native)" ;;
+			esac
+			;;
+		--native) install_server_native ;;
 		client) install_client "$@" ;;
 		--uninstall | uninstall) uninstall ;;
 		-h | --help)

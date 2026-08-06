@@ -285,7 +285,8 @@ panic_banner() {
 
 		  ┌─ IF YOUR NETWORK EVER DIES, RUN THIS ─────────────────────────────┐
 		  │   sudo nft delete table inet transtation 2>/dev/null              │
-		  │   for p in \$(seq 9000 9010); do sudo ip rule del priority \$p; done │
+		  │   for p in \$(seq 9000 9010); do while sudo ip rule del priority \$p;  │
+		  │     do :; done; done                                             │
 		  │   sudo ip link del $TUN_IFACE                                              │
 		  └───────────────────────────────────────────────────────────────────┘
 		  (or:  sudo transtation-panic  --  or the 'panic' verb of this image)
@@ -300,10 +301,15 @@ cmd_panic() {
 	nft delete table ip6 transtation 2>/dev/null || true
 	# sing-box's own ip rules live at priority 9000-9010 and are NOT bound to
 	# the interface, so they outlive a SIGKILLed container.
+	# Several rules can share one priority and `ip rule del priority N` removes
+	# exactly one, so one pass per priority leaves the rest behind. Verified on
+	# a live host, where two rules sat at 9003.
 	_p=9000
 	while [ "$_p" -le 9010 ]; do
-		ip -4 rule del priority "$_p" 2>/dev/null || true
-		ip -6 rule del priority "$_p" 2>/dev/null || true
+		_n=0
+		while [ "$_n" -lt 20 ] && ip -4 rule del priority "$_p" 2>/dev/null; do _n=$((_n + 1)); done
+		_n=0
+		while [ "$_n" -lt 20 ] && ip -6 rule del priority "$_p" 2>/dev/null; do _n=$((_n + 1)); done
 		_p=$((_p + 1))
 	done
 	ip route flush table 2022 2>/dev/null || true

@@ -15,12 +15,12 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.1}
+VERSION=${TT_VERSION:-v1.0.2}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
 IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.1, and the hash-verified installer you read would vouch for nothing.
+# v1.0.2, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
 CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 
@@ -316,8 +316,8 @@ install_client() {
 			nft delete table inet transtation 2>/dev/null
 			nft delete table ip6 transtation 2>/dev/null
 			for p in $(seq 9000 9010); do
-			  ip -4 rule del priority "$p" 2>/dev/null
-			  ip -6 rule del priority "$p" 2>/dev/null
+			  n=0; while [ "$n" -lt 20 ] && ip -4 rule del priority "$p" 2>/dev/null; do n=$((n+1)); done
+			  n=0; while [ "$n" -lt 20 ] && ip -6 rule del priority "$p" 2>/dev/null; do n=$((n+1)); done
 			done
 			ip route flush table 2022 2>/dev/null
 			ip -6 route flush table 2022 2>/dev/null

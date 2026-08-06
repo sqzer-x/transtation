@@ -471,6 +471,36 @@ transfer, **not** against a compromised upstream — Xray publishes no signature
 sing-box publishes no checksum file at all, so its hashes are pinned in
 `client/Dockerfile` and reviewed as part of this repo.
 
+## What has actually been tested
+
+Claims in this README are things that were run, not things that were reasoned
+about. The full picture, on a Korean client and an AWS Tokyo VPS:
+
+- **Server on a real VPS.** `install.sh` on Ubuntu 24.04: installs Docker,
+  pulls the image, healthy in 12s, `verify` completes a REALITY handshake and
+  reports `warp=on colo=NRT`.
+- **Client to server across the internet, no tunnels.** Client container in
+  Korea to `203.0.113.10:443` in Tokyo. 10 MB in 1.21 s (≈8.3 MB/s) through
+  Korea → Tokyo → WARP.
+- **The camouflage, from outside.** `openssl s_client` against the server on
+  :443 returns a genuine `C=JP, O=TVer INC., CN=*.tver.jp` certificate over
+  TLS 1.3 — the dest the auto-selection chose for a Japanese server, unprompted.
+- **Users.** Added a second user, connected as them, revoked them; their client
+  stopped working and the first one kept going.
+- **Whole-host tunnel.** `MODE=tun` moved the host's egress from its ISP address
+  to WARP, kept `DIRECT_SUFFIXES` domains on their real path, and `SIGKILL` of
+  the container left `curl` timing out rather than leaking. `transtation-panic`
+  restored direct egress with no rules, no interface and no table left behind,
+  and without disturbing Tailscale's rules or other containers.
+- **Rootless.** `MODE=proxy` works under rootless Podman. `MODE=tun` there
+  refuses with the reason rather than half-starting; under rootful Podman it
+  works.
+- **arm64.** The published arm64 image runs its selftest under emulation.
+
+Not tested, and therefore not claimed: SELinux hosts, Docker Desktop on Windows
+or macOS, Docker older than 29, and IPv6-only hosts (the killswitch refuses
+those outright rather than building a broken ruleset).
+
 ## Building and testing yourself
 
 ```

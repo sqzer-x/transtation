@@ -5,11 +5,11 @@ This project is licensed under the MIT License (see LICENSE).
 
 transtation itself contains no third-party source code. It is a set of shell
 scripts and one Dockerfile. The server image redistributes third-party binaries
-unmodified; the client installer downloads one rather than shipping it. Their
-licenses and obligations follow.
+unmodified; the native server install and the client install download them from
+upstream and verify them instead. Their licenses and obligations follow.
 
 ================================================================================
-Xray-core  --  redistributed in ghcr.io/sqzer-x/transtation
+Xray-core  --  redistributed in the image; downloaded by the native installer
 ================================================================================
 
 Xray-core is licensed under the Mozilla Public License, Version 2.0 (MPL-2.0).
@@ -24,6 +24,11 @@ The `xray` binary in our image is the official upstream release artifact,
 byte-for-byte unmodified. We do not patch, recompile, or statically link it
 into anything. It is copied into the image as-is.
 
+The native install (`install.sh server --native`) does not redistribute it at
+all: it downloads the same release artifact from the URL above at install time,
+verifies it against the `.dgst` published with that release, and installs it
+under /usr/local/lib/transtation.
+
 The Source Code Form of Xray-core is governed by the MPL-2.0. A copy of that
 license is available at https://mozilla.org/MPL/2.0/ and is distributed with
 the upstream source at the URL above.
@@ -33,7 +38,7 @@ licenses (CC-BY-SA / GPL-3.0 depending on the dataset) and none of them apply
 here.
 
 ================================================================================
-wgcf  --  redistributed in ghcr.io/sqzer-x/transtation
+wgcf  --  redistributed in the image; downloaded by the native installer
 ================================================================================
 
 wgcf is licensed under the MIT License.
@@ -45,7 +50,8 @@ wgcf is licensed under the MIT License.
 
 The `wgcf` binary is the official upstream release artifact, unmodified. It is
 used only once, at first boot, to register a Cloudflare WARP identity. It is
-not part of the data path.
+not part of the data path. As with Xray, the native install downloads and
+verifies it rather than redistributing it.
 
 Upstream's own disclaimer, reproduced verbatim:
 

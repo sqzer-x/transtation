@@ -4,8 +4,8 @@ Your own VLESS + REALITY proxy, with optional Cloudflare WARP egress, in one
 container on any Linux box that has Docker.
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.14/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.14 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.15/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.15 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -46,8 +46,8 @@ how you feel about a container runtime on your VPS.
 ### In a container (default)
 
 ```
-curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.14/install.sh
-sha256sum install.sh      # compare against the hash in the v1.0.14 release notes
+curl -fsSLO https://raw.githubusercontent.com/sqzer-x/transtation/v1.0.15/install.sh
+sha256sum install.sh      # compare against the hash in the v1.0.15 release notes
 less install.sh           # please actually read it
 sudo sh install.sh
 ```
@@ -513,7 +513,9 @@ The Xray binary is verified inside the Dockerfile against the `.dgst` file from
 the same GitHub release. That defends against a bad mirror or a truncated
 transfer, **not** against a compromised upstream — Xray publishes no signatures.
 sing-box publishes no checksum file at all, so its hashes are pinned in
-`client/Dockerfile` and reviewed as part of this repo.
+`install.sh` and reviewed as part of this repo. The native server install
+verifies Xray the same way the image does, against the `.dgst` from its own
+release, and wgcf against upstream's `checksums.txt`.
 
 ## What has been tested
 

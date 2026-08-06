@@ -15,14 +15,12 @@
 # last line. If the download is truncated, nothing runs.
 set -eu
 
-VERSION=${TT_VERSION:-v1.0.14}
+VERSION=${TT_VERSION:-v1.0.15}
 IMAGE_SERVER=${TT_IMAGE_SERVER:-ghcr.io/sqzer-x/transtation}
-IMAGE_CLIENT=${TT_IMAGE_CLIENT:-ghcr.io/sqzer-x/transtation-client}
 # Filled in by the release workflow. A tag is mutable -- the same stolen-token
 # compromise we already concede for Xray's .dgst would let someone retag
-# v1.0.14, and the hash-verified installer you read would vouch for nothing.
+# v1.0.15, and the hash-verified installer you read would vouch for nothing.
 SERVER_DIGEST=${TT_SERVER_DIGEST:-}
-CLIENT_DIGEST=${TT_CLIENT_DIGEST:-}
 
 # sing-box ships no checksum file, so these were computed once from the official
 # release artifacts and are reviewed as part of this repo. The -musl builds are
@@ -62,7 +60,6 @@ step() { printf '  %-14s%s\n' "$1" "$2"; }
 die() { printf '\ntranstation: %s\n\n' "$*" >&2; exit 1; }
 
 server_image() { printf '%s:%s%s' "$IMAGE_SERVER" "$VERSION" "${SERVER_DIGEST:+@$SERVER_DIGEST}"; }
-client_image() { printf '%s:%s%s' "$IMAGE_CLIENT" "$VERSION" "${CLIENT_DIGEST:+@$CLIENT_DIGEST}"; }
 
 need_root() {
 	[ "$(id -u)" = 0 ] || die "this needs root. Re-run as root, or with sudo:

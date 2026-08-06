@@ -10,9 +10,9 @@ less install.sh           # please actually read it
 sudo sh install.sh
 ```
 
-That is the whole server install. It generates its own Reality keypair, its own
-user, registers a WARP identity, and prints a `vless://` link and a QR code you
-scan with any client app.
+That is the whole server install. It generates its own Reality keypair and its
+first user, registers a WARP identity, and prints the connection details as a
+`vless://` link with a QR of the same link.
 
 ---
 

@@ -237,6 +237,7 @@ what you want to change; every value is read fresh on each boot.
 | `PORT` | `443` | public port |
 | `HOST` | auto-detected | address that goes into the share link |
 | `SNI` | *auto-selected* | the site your server impersonates — leave unset |
+| `CLIENT_REGION` | server's country | two-letter code for where your clients connect from |
 | `DEST` | `$SNI:443` | where the handshake is forwarded |
 | `WARP` | `1` | `0` to egress from the VPS IP instead |
 | `WARP_ENDPOINT` | `162.159.192.1:2408` | override if this anycast address does not handshake |
@@ -247,36 +248,60 @@ what you want to change; every value is read fresh on each boot.
 ### The dest picks itself
 
 The single most important setting is which real site your server impersonates,
-so transtation chooses it for you on first boot — the way a commercial VPN
-picks your nearest exit rather than making you read a server list.
+so transtation chooses it on first boot — the way a commercial VPN picks your
+nearest exit rather than making you read a server list.
 
-It reads the server's own country from `cloudflare.com/cdn-cgi/trace`, then
-probes same-region candidates alongside always-available anycast ones, in
-parallel, and scores what survives:
+**The thing that gets you blocked is not a slow dest, it is an implausible
+one.** Your clients' ISP sees their traffic labelled with this name and judges
+the volume and shape of it against what the name implies. Hours of sustained
+multi-gigabyte download addressed to a corporate brochure page is not something
+a human does, and a DPI box that has already taken an interest in your server's
+address starts dropping the connection. The same bytes pulled from a video
+service are what everyone does all evening.
+
+So candidates carry a curated class, and it dominates the score:
+
+| class | what it is | weight |
+|---|---|---|
+| `bulk` | video, streaming, real download and CDN hosts. Sustained multi-GB transfer and hours-long connections are unremarkable. | 0 |
+| `mixed` | media-heavy portals. Moderate sustained traffic is fine; a torrent of it is a bit odd. | +800 |
+| `light` | corporate sites, marketing pages, DNS endpoints. Bulk transfer here looks exactly as wrong as it is. | +2500 |
+
+The weights are in milliseconds so they compare directly against measured
+latency, and they are deliberately lopsided: being dropped is fatal, a slower
+dest merely adds to connection setup.
+
+This class is a judgement about the internet, not something a probe can
+measure — `accept-ranges` was tested for the job and does not discriminate
+(`dl.google.com` answers `none` on its root path; `addons.mozilla.org` answers
+`bytes`). Everything else *is* measured, from the server, in parallel:
 
 - **hard filter** — the handshake must succeed, it must be TLS 1.3, and the
-  certificate chain must be comfortably under the size where REALITY breaks
+  certificate chain must have headroom under the size where REALITY breaks.
+  Both halves earn their keep: `abema.tv` is an otherwise ideal Japanese video
+  dest that serves only TLS 1.2, and `www.hulu.com` has a 4717-byte chain.
 - **latency** — the measured TLS handshake time, because your server re-dials
-  this site on every single client connection
-- **region bonus** — a same-region candidate wins ties up to 120 ms. This is not
-  cosmetic: matching the dest to the server's own region and ASN is what makes
-  the traffic look ordinary to a DPI box that has already taken an interest in
-  the address.
-
-From a Korean VPS it picks a Korean site at 61 ms over `dl.google.com` at
-164 ms; from a German one it will not.
+  this site on every single client connection.
+- **region** — worth 150 ms. The region that matters is where your *clients*
+  are, not where your server is: the ISP judging the traffic is theirs.
+  Defaults to the server's country; set `CLIENT_REGION` when they differ.
 
 ```
 $ transtation sni
-  sni     www.kakaocorp.com
-  why     best of KR-region and global candidates: 61ms TLS handshake, 884-byte certificate chain
+  sni     tv.naver.com
+  why     sustained heavy traffic is unremarkable here; same region as your
+          clients; 54ms TLS handshake, 3480-byte chain
   since   2026-08-06
 ```
 
-**The choice is sticky.** It lives in the data volume and is never re-picked on
-its own, because every share link carries `sni=` — silently changing it would
-break every client you have already handed out. Re-picking is explicit, and
-says so:
+From a Korean VPS it picks a Korean streaming service; with `CLIENT_REGION=JP`
+it picks `www.nicovideo.jp`; with no region it can determine at all, a global
+streaming brand.
+
+**The choice is sticky.** It lives in the data volume, is included in backups,
+and is never re-picked on its own — every share link carries `sni=`, so
+silently changing it would break every client you have already handed out.
+Re-picking is explicit, and says what it invalidates:
 
 ```
 transtation sni auto        # probe again and re-pick   (invalidates links)
